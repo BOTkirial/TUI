@@ -1,0 +1,71 @@
+/* Client Docker — complète common.tcss (styles partagés des TUI) */
+
+#page {
+    height: 1fr;
+    padding: 1;
+}
+
+#tabs {
+    height: 1fr;
+}
+
+TabPane {
+    padding: 1 0 0 0;
+}
+
+FilterPane {
+    height: 1fr;
+}
+
+.filter {
+    margin-bottom: 1;
+}
+
+/* filtre + case « En route uniquement » de l'onglet Conteneurs */
+.filter-row {
+    height: auto;
+    margin-bottom: 1;
+}
+
+.filter-row .filter {
+    width: 1fr;
+    margin-bottom: 0;
+}
+
+.resource-table {
+    height: 1fr;
+}
+
+#containers-body {
+    height: 1fr;
+}
+
+#containers {
+    width: 1fr;
+    height: 1fr;
+}
+
+#container-detail {
+    width: 2fr;
+    height: 1fr;
+    padding: 0 1;
+    overflow-y: auto;
+}
+
+.pane-buttons {
+    margin-top: 1;
+}
+
+.pane-count {
+    height: auto;
+    color: $text-muted;
+}
+
+/* --- écrans Logs / Inspect --- */
+#page > .button-bar {
+    margin: 1 0;
+}
+
+#log-output, #inspect-output {
+    height: 1fr;
+}

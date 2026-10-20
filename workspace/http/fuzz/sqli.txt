@@ -1,0 +1,7 @@
+'
+''
+' OR '1'='1
+' OR 1=1--
+" OR ""="
+'; DROP TABLE users;--
+1 UNION SELECT NULL--

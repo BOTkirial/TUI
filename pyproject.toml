@@ -1,0 +1,40 @@
+[project]
+name = "tui-tools"
+version = "0.2.0"
+description = "Trois TUI (client HTTP, client SQL, gestion Docker) dans un seul projet"
+requires-python = ">=3.10"
+dependencies = [
+    "textual>=0.80",
+    "httpx>=0.27",
+    "psycopg[binary]>=3.1",
+    "pymysql>=1.1",
+    "cryptography>=42.0",
+    "paramiko>=3.4",
+]
+
+# Deux commandes exposées après installation.
+# Nommées *-tui pour ne pas écraser le `http` de HTTPie sur une machine hôte.
+[project.scripts]
+http-tui = "httptui.app:main"
+sql-tui = "sqltui.app:main"
+docker-tui = "dockertui.app:main"
+
+[tool.setuptools]
+packages = ["tui_common", "httptui", "sqltui", "dockertui"]
+
+# Chaque paquet vit dans son sous-dossier d'origine (pas de réécriture d'imports).
+[tool.setuptools.package-dir]
+tui_common = "common/tui_common"
+httptui = "http-client/httptui"
+sqltui = "sql-client/sqltui"
+dockertui = "docker-client/dockertui"
+
+[tool.setuptools.package-data]
+tui_common = ["*.tcss"]
+httptui = ["*.tcss"]
+sqltui = ["*.tcss"]
+dockertui = ["*.tcss"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

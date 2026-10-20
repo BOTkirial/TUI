@@ -1,0 +1,6 @@
+#!/usr/bin/env sh
+# Lance le client HTTP dans le conteneur (démarre la stack au besoin).
+set -e
+cd "$(dirname "$0")"
+docker compose up -d
+exec docker compose exec tui http-tui

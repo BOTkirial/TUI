@@ -1,0 +1,84 @@
+/* Styles communs aux trois TUI (chargés avant le app.tcss de chacune,
+   qui peut les surcharger). Thème Textual par défaut. */
+
+Screen {
+    background: $surface;
+}
+
+/* titre d'écran */
+.title {
+    text-style: bold;
+    color: $accent;
+}
+
+.section {
+    color: $accent;
+    text-style: bold;
+    margin-top: 1;
+}
+
+.hint {
+    color: $text-muted;
+    margin-bottom: 1;
+}
+
+/* ligne d'état sous l'écran : auto, les messages longs passent à la ligne */
+#status {
+    height: auto;
+    color: $text-muted;
+    margin-top: 1;
+}
+
+/* listes, tableaux, éditeurs : même cadre partout */
+.framed {
+    border: round $primary-darken-2;
+}
+
+/* rangée de boutons de même largeur, alignée sur les bords du bloc */
+.button-row {
+    height: auto;
+    margin-top: 1;
+}
+
+.button-row Button {
+    width: 1fr;
+    /* le min-width par défaut (16) fait déborder 4 boutons ou plus */
+    min-width: 0;
+    margin: 0 1 0 0;
+}
+
+.button-row Button:last-child {
+    margin: 0;
+}
+
+/* rangée de boutons à largeur naturelle (barres d'actions) */
+.button-bar {
+    height: auto;
+}
+
+.button-bar > * {
+    margin: 0 1 0 0;
+}
+
+/* --- fenêtres modales ------------------------------------------------- */
+ModalScreen {
+    align: center middle;
+}
+
+#dialog {
+    width: 72;
+    max-width: 100%;
+    height: auto;
+    border: round $accent;
+    background: $surface;
+    padding: 1 2;
+}
+
+#dialog-buttons {
+    height: auto;
+    margin-top: 1;
+}
+
+#dialog-buttons Button {
+    margin: 0 1 0 0;
+}

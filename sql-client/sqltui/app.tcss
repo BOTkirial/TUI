@@ -1,0 +1,99 @@
+/* Client SQL — complète common.tcss (styles partagés des TUI) */
+
+/* --- écran d'accueil (connexions) : bloc centré --- */
+ConnectionScreen {
+    align: center top;
+}
+
+#conn-page {
+    width: 90;
+    max-width: 100%;
+    height: auto;
+    margin: 1 0;
+    padding: 1 2;
+    border: round $accent;
+}
+
+#filter {
+    margin-bottom: 1;
+}
+
+#connections {
+    height: 12;
+}
+
+/* --- écran de requêtes --- */
+#main {
+    height: 1fr;
+}
+
+#sidebar {
+    width: 38;
+    padding: 1;
+    border-right: solid $primary-darken-2;
+}
+
+#workspace {
+    width: 1fr;
+    padding: 1;
+}
+
+#tables {
+    height: 1fr;
+}
+
+.editor-area {
+    height: 8;
+    margin-bottom: 1;
+}
+
+#results {
+    height: 1fr;
+}
+
+/* --- formulaire de connexion (fenêtre modale) --- */
+ConnectionForm {
+    /* formulaire haut (tunnel SSH) : défile sur un petit terminal */
+    overflow-y: auto;
+}
+
+ConnectionForm #dialog {
+    width: 110;
+}
+
+#form-columns {
+    height: auto;
+}
+
+.form-column {
+    width: 1fr;
+    height: auto;
+}
+
+.form-column:first-child {
+    margin-right: 2;
+}
+
+#dialog Input, #dialog Select, #dialog Checkbox {
+    margin-bottom: 1;
+}
+
+/* les champs ont déjà leur marge basse */
+ConnectionForm #dialog-buttons {
+    margin-top: 0;
+}
+
+#form-status {
+    height: auto;
+    color: $text-muted;
+    margin-top: 1;
+}
+
+/* --- édition d'une cellule (fenêtre modale) --- */
+CellEditor #dialog {
+    width: 80;
+}
+
+#cell-value {
+    height: 8;
+}
