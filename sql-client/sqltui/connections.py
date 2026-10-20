@@ -43,9 +43,12 @@ class Connection:
 
 
 def config_path() -> Path:
-    """Chemin du fichier de connexions (respecte XDG_CONFIG_HOME)."""
-    base = os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
-    return Path(base) / "sqltui" / "connections.json"
+    """Chemin du fichier de connexions : $SQL_CONNECTIONS_DIR, sinon $XDG_CONFIG_HOME/sqltui."""
+    folder = os.environ.get("SQL_CONNECTIONS_DIR")
+    if not folder:
+        base = os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
+        folder = Path(base) / "sqltui"
+    return Path(folder) / "connections.json"
 
 
 class ConnectionStore:

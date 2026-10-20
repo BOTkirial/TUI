@@ -14,9 +14,10 @@ services:
       HTTP_ROOT: /work/http
       HTTP_REQUESTS_DIR: /work/http/requests
       SQL_ROOT: /work/sql
+      # connexions SQL (+ known_hosts SSH) dans le workspace, ignorées par git
+      SQL_CONNECTIONS_DIR: /work/sql/connections
     volumes:
       - ./workspace:/work
-      - tui-config:/root/.config/sqltui
       # Pour importer tes vraies connexions DBeaver (lecture seule) :
       - ${HOME}/.local/share/DBeaverData:/root/.local/share/DBeaverData:ro
       # Clés et known_hosts pour les tunnels SSH du client SQL (lecture seule)
@@ -28,6 +29,3 @@ services:
       # (labels des conteneurs) ; $HOME monté au même chemin, en lecture seule
       - ${HOME}:${HOME}:ro
     command: sleep infinity
-
-volumes:
-  tui-config:

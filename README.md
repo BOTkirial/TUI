@@ -73,7 +73,8 @@ pip install --upgrade git+https://github.com/BOTkirial/TUI.git
 
 Les TUI lisent le **répertoire courant** : `http-tui` lit `./requests/` (et
 `./fuzz/`), `sql-tui` cherche les `.env` dans `.` ; surchargeables via `HTTP_ROOT`,
-`HTTP_REQUESTS_DIR`, `FUZZ_DIR`, `SQL_ROOT`. `docker-tui` utilise le CLI `docker`
+`HTTP_REQUESTS_DIR`, `FUZZ_DIR`, `SQL_ROOT`. Les connexions SQL sont enregistrées
+dans `~/.config/sqltui/` (ou `$SQL_CONNECTIONS_DIR` si définie). `docker-tui` utilise le CLI `docker`
 (et le plugin `compose`) de la machine.
 
 ### Dev local
@@ -151,7 +152,8 @@ Raccourcis — liste : `ctrl+n` nouvelle · `ctrl+o` import curl · `F5` actuali
 - **Écran d'accueil « Connexions »** au lancement : choisis ou crée une connexion,
   puis « Connecter » (ou Entrée) ouvre l'écran de requêtes. Échap y revient.
 - **Nouvelle connexion** : bouton « Nouvelle » → formulaire (nom, driver, hôte,
-  port, base, utilisateur, mot de passe). Stockées dans le volume `tui-config`.
+  port, base, utilisateur, mot de passe). Stockées dans `workspace/sql/connections/`
+  (Docker, ignoré par git — mots de passe en clair) ou `~/.config/sqltui/` (pip).
 - **Import depuis DBeaver** (métadonnées + tentative de déchiffrement local).
 - **Lecture `.env`** (`DATABASE_URL` ou `DB_HOST`/`DB_PORT`/…).
 - Moteurs : **PostgreSQL**, **MySQL**, **MariaDB**.
