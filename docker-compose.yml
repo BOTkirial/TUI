@@ -13,7 +13,6 @@ services:
     environment:
       HTTP_ROOT: /work/http
       HTTP_REQUESTS_DIR: /work/http/requests
-      SQL_ROOT: /work/sql
       # connexions SQL (+ known_hosts SSH) dans le workspace, ignorées par git
       SQL_CONNECTIONS_DIR: /work/sql/connections
     volumes:

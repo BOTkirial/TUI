@@ -8,8 +8,6 @@ import shutil
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
-from tui_common import parse_env
-
 # pilotes supportés -> port par défaut
 DEFAULT_PORTS = {"postgres": 5432, "mysql": 3306, "mariadb": 3306}
 
@@ -101,63 +99,3 @@ class ConnectionStore:
         self.connections = [c for c in self.connections if c.name != name]
         self.save()
 
-
-def connection_from_env(env_path: str | Path) -> Connection | None:
-    """Construit une connexion à partir d'un .env.
-
-    Reconnaît soit DATABASE_URL, soit les variables DB_HOST/DB_PORT/etc.
-    None si le .env ne décrit pas réellement une base (ni nom de base ni utilisateur).
-    """
-    env = parse_env(env_path)
-    if not env:
-        return None
-
-    name = Path(env_path).name
-
-    url = env.get("DATABASE_URL") or env.get("DB_URL")
-    if url:
-        conn = _connection_from_url(name, url)
-    else:
-        conn = _connection_from_vars(name, env)
-    return conn if conn.database or conn.user else None
-
-
-def _connection_from_vars(name: str, env: dict[str, str]) -> Connection:
-    driver = _normalize_driver(env.get("DB_DRIVER") or env.get("DB_CONNECTION") or "postgres")
-    return Connection(
-        name=name,
-        driver=driver,
-        host=env.get("DB_HOST", "localhost"),
-        port=int(env.get("DB_PORT", DEFAULT_PORTS[driver])),
-        database=env.get("DB_NAME") or env.get("DB_DATABASE", ""),
-        user=env.get("DB_USER") or env.get("DB_USERNAME", ""),
-        password=env.get("DB_PASSWORD") or env.get("DB_PASS", ""),
-    )
-
-
-def _normalize_driver(value: str) -> str:
-    value = value.lower()
-    if "postgre" in value or value == "pgsql":
-        return "postgres"
-    if "maria" in value:
-        return "mariadb"
-    if "mysql" in value:
-        return "mysql"
-    return value if value in DEFAULT_PORTS else "postgres"
-
-
-def _connection_from_url(name: str, url: str) -> Connection:
-    """Parse une URL type postgres://user:pass@host:port/db."""
-    from urllib.parse import urlparse
-
-    parsed = urlparse(url)
-    driver = _normalize_driver(parsed.scheme.split("+")[0])
-    return Connection(
-        name=name,
-        driver=driver,
-        host=parsed.hostname or "localhost",
-        port=parsed.port or DEFAULT_PORTS[driver],
-        database=(parsed.path or "").lstrip("/"),
-        user=parsed.username or "",
-        password=parsed.password or "",
-    )

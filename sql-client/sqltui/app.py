@@ -35,7 +35,6 @@ from tui_common import (
     ConfirmPrompt,
     CopyTable,
     call_ui,
-    discover_env_files,
     matches,
     to_clipboard,
 )
@@ -45,7 +44,6 @@ from .connections import (
     DEFAULT_PORTS,
     Connection,
     ConnectionStore,
-    connection_from_env,
 )
 from .drivers import ColumnSource, Database, QueryResult, RowUpdate, TableRef
 from .dumpcmd import dump_command, restore_command
@@ -319,7 +317,6 @@ class ConnectionScreen(Screen):
                 yield Button("Supprimer", id="delete", variant="error")
             with Horizontal(classes="button-row"):
                 yield Button("Import DBeaver", id="dbeaver")
-                yield Button("Import .env", id="fromenv")
             yield Static("", id="status")
         yield Footer()
 
@@ -356,7 +353,6 @@ class ConnectionScreen(Screen):
             "edit": self.action_edit,
             "delete": self.action_delete,
             "dbeaver": self._import_dbeaver,
-            "fromenv": self._import_from_env,
         }
         handler = handlers.get(event.button.id or "")
         if handler:
@@ -518,26 +514,6 @@ class ConnectionScreen(Screen):
         if self._save_store(self.app.store.add, *imported):
             self._refresh_connections()
             self.app.notify(f"{len(imported)} connexion(s) importée(s) de DBeaver")
-
-    def _import_from_env(self) -> None:
-        conns, skipped = [], []
-        for env_file in discover_env_files(self.app.root):
-            try:
-                conn = connection_from_env(env_file)
-            except (OSError, ValueError):  # port non numérique, fichier illisible…
-                skipped.append(env_file.name)
-                continue
-            if conn:
-                conns.append(conn)
-        if skipped:
-            self.app.notify(f".env ignoré(s) (illisible ou invalide) : {', '.join(skipped)}",
-                            severity="warning")
-        if conns:
-            if self._save_store(self.app.store.add, *conns):
-                self._refresh_connections()
-                self.app.notify(f"{len(conns)} connexion(s) importée(s) depuis des .env")
-        elif not skipped:
-            self.app.notify("Aucun .env décrivant une base", severity="warning")
 
 
 class SubmitTextArea(TextArea):
@@ -979,9 +955,8 @@ class SqlTui(BaseApp):
     CSS_PATH = [COMMON_CSS, "app.tcss"]
     TITLE = "SQL TUI"
 
-    def __init__(self, root: str = "."):
+    def __init__(self):
         super().__init__()
-        self.root = root
         self.store = ConnectionStore()
 
     def on_mount(self) -> None:
@@ -1039,8 +1014,7 @@ class SqlTui(BaseApp):
 
 
 def main() -> None:
-    root = os.environ.get("SQL_ROOT", ".")
-    SqlTui(root=root).run()
+    SqlTui().run()
 
 
 if __name__ == "__main__":

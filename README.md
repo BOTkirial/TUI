@@ -15,8 +15,8 @@ tui-tools/
 ├── pyproject.toml        # packaging : commandes http-tui / sql-tui / docker-tui
 ├── workspace/            # fichiers partagés hôte <-> conteneur (édite-les dans Zed)
 │   ├── http/             # requests/ (1 fichier = 1 requête), capture.har, fuzz/
-│   └── sql/              # tes .env de connexion
-├── common/tui_common/    # briques partagées (copie auto, .env, app de base)
+│   └── sql/              # connections/ (connexions enregistrées, ignorées par git)
+├── common/tui_common/    # briques partagées (copie auto, app de base)
 ├── http-client/httptui/  # code du client HTTP
 ├── sql-client/sqltui/    # code du client SQL
 └── docker-client/dockertui/  # code du client Docker
@@ -52,7 +52,7 @@ qui tourne dans le terminal de Zed voit les fichiers en direct. Les deux TUI
 lisent par défaut :
 
 - HTTP → `workspace/http/requests/` (un `.http` par requête)
-- SQL  → `workspace/sql/` (fichiers `.env`)
+- SQL  → `workspace/sql/connections/` (connexions enregistrées)
 
 ## Sans Docker
 
@@ -72,8 +72,8 @@ pip install --upgrade git+https://github.com/BOTkirial/TUI.git
 > commandes ajoutées dans `~/.local/bin`).
 
 Les TUI lisent le **répertoire courant** : `http-tui` lit `./requests/` (et
-`./fuzz/`), `sql-tui` cherche les `.env` dans `.` ; surchargeables via `HTTP_ROOT`,
-`HTTP_REQUESTS_DIR`, `FUZZ_DIR`, `SQL_ROOT`. Les connexions SQL sont enregistrées
+`./fuzz/`) ; surchargeables via `HTTP_ROOT`,
+`HTTP_REQUESTS_DIR`, `FUZZ_DIR`. Les connexions SQL sont enregistrées
 dans `~/.config/sqltui/` (ou `$SQL_CONNECTIONS_DIR` si définie). `docker-tui` utilise le CLI `docker`
 (et le plugin `compose`) de la machine.
 
@@ -155,12 +155,9 @@ Raccourcis — liste : `ctrl+n` nouvelle · `ctrl+o` import curl · `F5` actuali
   port, base, utilisateur, mot de passe). Stockées dans `workspace/sql/connections/`
   (Docker, ignoré par git — mots de passe en clair) ou `~/.config/sqltui/` (pip).
 - **Import depuis DBeaver** (métadonnées + tentative de déchiffrement local).
-- **Lecture `.env`** (`DATABASE_URL` ou `DB_HOST`/`DB_PORT`/…).
 - Moteurs : **PostgreSQL**, **MySQL**, **MariaDB**.
 
-Dans la TUI, bouton **« Import .env »** : les connexions décrites par les `.env`
-de `workspace/sql/` sont ajoutées. Clic sur une
-table → `SELECT * … LIMIT 100`. `ctrl+r` exécute (la sélection si présente).
+Clic sur une table → `SELECT * … LIMIT 100`. `ctrl+r` exécute (la sélection si présente).
 
 ### Éditer les résultats
 
