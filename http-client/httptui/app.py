@@ -727,8 +727,12 @@ class RequestScreen(Screen[HttpRequest]):
         row = next((r for r in self.fuzz_rows if r.idx == idx), None)
         if row is None:
             return
-        self.query_one("#response", TextArea).text = self._format_fuzz_detail(row)
+        response = self.query_one("#response", TextArea)
+        response.text = self._format_fuzz_detail(row)
         self.query_one("#main-tabs", TabbedContent).active = "tab-response"
+        # le focus doit quitter le tableau : resté dans l'onglet Fuzzing (Entrée),
+        # il y fait revenir TabbedContent (TabPane.Focused)
+        response.focus()
 
     def on_data_table_header_selected(self, event: DataTable.HeaderSelected) -> None:
         # clic sur un en-tête -> tri (toggle croissant/décroissant)
