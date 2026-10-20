@@ -54,10 +54,32 @@ lisent par défaut :
 - HTTP → `workspace/http/requests/` (un `.http` par requête)
 - SQL  → `workspace/sql/` (fichiers `.env`)
 
-## Sans Docker (dev local)
+## Sans Docker
+
+### Installation avec pip
+
+Python ≥ 3.10 requis. Installe les commandes `http-tui`, `sql-tui` et `docker-tui` :
 
 ```bash
-pip install -e .            # installe les commandes http-tui / sql-tui
+pip install git+https://github.com/BOTkirial/TUI.git
+# mise à jour
+pip install --upgrade git+https://github.com/BOTkirial/TUI.git
+```
+
+> Sur Debian/Ubuntu récents, `pip` refuse d'installer hors environnement virtuel
+> (« externally-managed-environment ») : utiliser plutôt
+> `pipx install git+https://github.com/BOTkirial/TUI.git` (environnement isolé,
+> commandes ajoutées dans `~/.local/bin`).
+
+Les TUI lisent le **répertoire courant** : `http-tui` lit `./requests/` (et
+`./fuzz/`), `sql-tui` cherche les `.env` dans `.` ; surchargeables via `HTTP_ROOT`,
+`HTTP_REQUESTS_DIR`, `FUZZ_DIR`, `SQL_ROOT`. `docker-tui` utilise le CLI `docker`
+(et le plugin `compose`) de la machine.
+
+### Dev local
+
+```bash
+pip install -e .            # installe les commandes en mode éditable
 cd workspace/http && http-tui
 cd workspace/sql  && sql-tui
 ```
