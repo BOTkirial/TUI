@@ -443,6 +443,8 @@ class ResourcePane(FilterPane):
         current = self.selected()
         current_key = self.key(current) if current is not None else None
         column = table.cursor_column
+        old_row = table.cursor_row
+        scroll = (table.scroll_x, table.scroll_y)
         terms = self.filter_terms()
         if filter_changed and terms:
             current_key = None
@@ -459,12 +461,28 @@ class ResourcePane(FilterPane):
             # Text : un nom contenant `[` ne doit pas être lu comme du markup
             table.add_row(*(Text(c) for c in cells))
         keys = [self.key(item) for item in self._visible]
-        row = keys.index(current_key) if current_key in keys else 0
+        if current_key in keys:
+            row = keys.index(current_key)
+        elif filter_changed:
+            row = 0
+        else:
+            # élément disparu (supprimé) : le suivant prend sa place
+            row = min(old_row, len(keys) - 1)
         if keys:
-            table.move_cursor(row=row, column=column)
+            table.move_cursor(row=row, column=column, scroll=False)
+            if not filter_changed:
+                # clear() remet le défilement à zéro ; on le restaure une fois la
+                # hauteur virtuelle recalculée (au prochain idle), sinon il serait
+                # borné à 0, puis on ne défile que si le curseur est hors de vue
+                table.call_after_refresh(self._restore_scroll, *scroll)
         self.query_one(".pane-count", Static).update(
             f"{len(self._visible)} / {len(self._items)} {self.plural}"
         )
+
+    def _restore_scroll(self, x: float, y: float) -> None:
+        table = self.list_widget
+        table.scroll_to(x, y, animate=False, immediate=True)
+        table.move_cursor(row=table.cursor_row)
 
     # --- évènements ----------------------------------------------------------
     def on_data_table_header_selected(self, event: DataTable.HeaderSelected) -> None:
@@ -666,6 +684,7 @@ class ContainersPane(FilterPane):
         self._filtering = filtering
         node = self.list_widget.cursor_node
         keep = _node_key(node) if node is not None else None
+        old_line = self.list_widget.cursor_line
 
         tree = self.list_widget
         tree.clear()
@@ -694,28 +713,37 @@ class ContainersPane(FilterPane):
             shown += len(found)
             if filtering or _node_key(node) not in self._collapsed:
                 node.expand()
-        self._focus(None if filter_changed and filtering else keep)
+        if filter_changed and filtering:
+            self._focus(None)
+        else:
+            self._focus(keep, None if filter_changed else old_line)
         total = len(self._snapshot.containers)
         running = sum(c.state == "running" for c in self._snapshot.containers)
         self.query_one(".pane-count", Static).update(
             f"{shown} / {total} conteneur(s) — {running} actif(s)"
         )
 
-    def _focus(self, key: str | None) -> None:
-        """Curseur sur le nœud `key`, sinon sur le premier conteneur affiché."""
+    def _focus(self, key: str | None, fallback_line: int | None = None) -> None:
+        """Curseur sur le nœud `key`, sinon sur la ligne `fallback_line` (nœud
+        disparu : son voisin prend sa place), sinon sur le premier conteneur."""
         tree = self.list_widget
         nodes = list(_iter_nodes(tree.root))
         target = next((n for n in nodes if _node_key(n) == key), None) if key else None
+        if target is not None and target.parent is not None:
+            target.parent.expand()
+        # Tree calcule les lignes paresseusement : lire last_line force ce calcul,
+        # sinon node.line vaut encore -1 et le curseur tombe sur la 1re ligne
+        last_line = tree.last_line
+        if target is None and fallback_line is not None and fallback_line >= 0 and last_line >= 0:
+            target = tree.get_node_at_line(min(fallback_line, last_line))
         if target is None:
             target = next((n for n in nodes if isinstance(n.data, Container)), None)
         if target is None:
             self._show_detail(None)
             return
-        if target.parent is not None:
+        if target.parent is not None and not target.parent.is_expanded:
             target.parent.expand()
-        # Tree calcule les lignes paresseusement : lire last_line force ce calcul,
-        # sinon node.line vaut encore -1 et le curseur tombe sur la 1re ligne
-        tree.last_line
+            tree.last_line
         tree.move_cursor(target)
         self._show_detail(target)
 
