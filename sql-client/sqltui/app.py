@@ -37,6 +37,7 @@ from tui_common import (
     call_ui,
     discover_env_files,
     matches,
+    to_clipboard,
 )
 
 from . import dbeaver
@@ -47,6 +48,7 @@ from .connections import (
     connection_from_env,
 )
 from .drivers import ColumnSource, Database, QueryResult, RowUpdate, TableRef
+from .dumpcmd import dump_command, restore_command
 
 DRIVERS = list(DEFAULT_PORTS)
 # champs du tunnel SSH, actifs seulement si la case « Tunnel SSH » est cochée
@@ -340,6 +342,11 @@ class ConnectionScreen(Screen):
     def _set_status(self, text: str) -> None:
         # Text : les messages d'erreur des pilotes ne sont pas du markup
         self.query_one("#status", Static).update(Text(text))
+
+    def dump_target(self) -> tuple[Connection, str] | None:
+        """Connexion et base visées par les commandes dump/restauration de la palette."""
+        conn = self._selected_connection()
+        return (conn, conn.database) if conn else None
 
     # --- évènements ------------------------------------------------------
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -644,6 +651,8 @@ class QueryScreen(Screen):
         # tables=None : pas de base courante (MySQL), la barre latérale liste les bases
         self._databases = databases or []
         self._choosing_db = tables is None
+        # base courante (MySQL : change avec ctrl+b), cible des commandes de dump
+        self._database = db.meta.database
         # tables (ou bases) affichées après filtre, dans l'ordre de la liste
         self._visible: list[str] = []
         # dernier résultat affiché et modifications en attente :
@@ -745,6 +754,7 @@ class QueryScreen(Screen):
 
     def _show_tables(self, database: str, tables: list[str]) -> None:
         self._choosing_db = False
+        self._database = database
         self._tables = tables
         self._set_sidebar(f"Tables — {database}", "filtrer les tables…")
         self._set_status(f"✓ Base {database} — {len(tables)} table(s) · ctrl+b : autres bases")
@@ -960,6 +970,10 @@ class QueryScreen(Screen):
         # Text : les messages d'erreur des pilotes ne sont pas du markup
         self.query_one("#status", Static).update(Text(text))
 
+    def dump_target(self) -> tuple[Connection, str] | None:
+        """Connexion et base visées par les commandes dump/restauration de la palette."""
+        return self._db.meta, self._database
+
 
 class SqlTui(BaseApp):
     CSS_PATH = [COMMON_CSS, "app.tcss"]
@@ -990,6 +1004,32 @@ class SqlTui(BaseApp):
             yield SystemCommand(
                 "Connexions", "Revenir à l'écran des connexions", screen.action_back
             )
+        if isinstance(screen, (ConnectionScreen, QueryScreen)):
+            yield SystemCommand(
+                "Copier la commande de dump",
+                "pg_dump / mysqldump de la base vers ~/Téléchargements",
+                lambda: self._copy_command(screen, dump_command, "dump"),
+            )
+            yield SystemCommand(
+                "Copier la commande de restauration",
+                "psql / mysql depuis un dump de ~/Téléchargements (nom du fichier à compléter)",
+                lambda: self._copy_command(screen, restore_command, "restauration"),
+            )
+
+    def _copy_command(self, screen, build, kind: str) -> None:
+        target = screen.dump_target()
+        if target is None:
+            self.notify("Aucune connexion sélectionnée", severity="warning")
+            return
+        conn, database = target
+        try:
+            command = build(conn, database)
+        except ValueError as exc:
+            self.notify(str(exc), severity="warning")
+            return
+        to_clipboard(self, command)
+        # pas la commande elle-même : elle contient le mot de passe
+        self.notify(f"Commande de {kind} copiée ({database or conn.name})", timeout=3)
 
     def open_query(
         self, db: Database, tables: list[str] | None, databases: list[str] | None = None
