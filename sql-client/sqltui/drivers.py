@@ -51,6 +51,18 @@ class RowUpdate:
     key: dict[str, Any]
 
 
+@dataclass
+class RowInsert:
+    """INSERT d'une ligne : valeurs saisies (None = NULL), les autres colonnes
+    prennent leur valeur par défaut ; `returning` = colonnes relues après coup
+    (valeurs générées : séquence, auto-incrément, DEFAULT), `key` = clé primaire."""
+
+    table: TableRef
+    values: dict[str, str | None]
+    returning: list[str]
+    key: list[str]
+
+
 class Database:
     """Connexion vivante vers une base, indépendante du moteur."""
 
@@ -192,8 +204,14 @@ class Database:
         return "`" + name.replace("`", "``") + "`"
 
     # --- édition des résultats --------------------------------------------
-    def apply_updates(self, updates: list[RowUpdate]) -> None:
-        """Applique les UPDATE dans une seule transaction : tout ou rien."""
+    def apply_updates(
+        self, updates: list[RowUpdate], inserts: list[RowInsert] = ()
+    ) -> list[tuple | None]:
+        """Applique les UPDATE puis les INSERT dans une seule transaction : tout ou rien.
+
+        Renvoie, par insertion, les colonnes `returning` relues (None si la
+        ligne insérée n'a pas pu être retrouvée).
+        """
         if self._conn is None:
             raise RuntimeError("Non connecté")
 
@@ -207,10 +225,36 @@ class Database:
                             f"{update.table[0]}.{update.table[1]} {update.key} : "
                             f"{cur.rowcount} ligne(s) touchée(s) au lieu d'une"
                         )
+                inserted = [self._insert(cur, insert) for insert in inserts]
             except Exception:
                 self._conn.rollback()
                 raise
             self._conn.commit()
+        return inserted
+
+    def delete_row(self, table: TableRef, key: dict[str, Any]) -> None:
+        """Supprime la ligne de clé primaire `key` ; refusé si elle n'en touche pas une seule."""
+        if self._conn is None:
+            raise RuntimeError("Non connecté")
+
+        condition = " AND ".join(f"{self._quote(col)} = %s" for col in key)
+        with self._conn.cursor() as cur:
+            try:
+                cur.execute(
+                    f"DELETE FROM {self._table_name(table)} WHERE {condition}", list(key.values())
+                )
+                if cur.rowcount != 1:
+                    raise RuntimeError(
+                        f"{table[0]}.{table[1]} {key} : "
+                        f"{cur.rowcount} ligne(s) touchée(s) au lieu d'une"
+                    )
+            except Exception:
+                self._conn.rollback()
+                raise
+            self._conn.commit()
+
+    def _table_name(self, table: TableRef) -> str:
+        return f"{self._quote(table[0])}.{self._quote(table[1])}"
 
     def _quote(self, name: str) -> str:
         """Identifiant échappé pour une requête paramétrée."""
@@ -219,11 +263,39 @@ class Database:
         return quote + name.replace(quote, quote * 2).replace("%", "%%") + quote
 
     def _update_sql(self, update: RowUpdate) -> tuple[str, list[Any]]:
-        table = f"{self._quote(update.table[0])}.{self._quote(update.table[1])}"
+        table = self._table_name(update.table)
         assignments = ", ".join(f"{self._quote(col)} = %s" for col in update.values)
         condition = " AND ".join(f"{self._quote(col)} = %s" for col in update.key)
         params = [*update.values.values(), *update.key.values()]
         return f"UPDATE {table} SET {assignments} WHERE {condition}", params
+
+    def _insert(self, cur, insert: RowInsert) -> tuple | None:
+        """Insère une ligne et relit ses colonnes `returning`."""
+        table = self._table_name(insert.table)
+        columns = ", ".join(self._quote(col) for col in insert.values)
+        placeholders = ", ".join(["%s"] * len(insert.values))
+        params = list(insert.values.values())
+        returning = ", ".join(self._quote(col) for col in insert.returning)
+        if self.meta.driver == "postgres":
+            values = f"({columns}) VALUES ({placeholders})" if insert.values else "DEFAULT VALUES"
+            cur.execute(f"INSERT INTO {table} {values} RETURNING {returning}", params)
+            return cur.fetchone()
+
+        # MySQL : pas de RETURNING (MariaDB seulement) -> relecture par la clé
+        # primaire, la colonne manquante étant l'auto-incrément
+        cur.execute(f"INSERT INTO {table} ({columns}) VALUES ({placeholders})", params)
+        if cur.rowcount != 1:
+            raise RuntimeError(f"{insert.table[0]}.{insert.table[1]} : insertion refusée")
+        key = {col: insert.values[col] for col in insert.key if col in insert.values}
+        missing = [col for col in insert.key if col not in key]
+        if len(missing) > 1 or (missing and not cur.lastrowid):
+            return None
+        if missing:
+            key[missing[0]] = cur.lastrowid
+        condition = " AND ".join(f"{self._quote(col)} = %s" for col in key)
+        cur.execute(f"SELECT {returning} FROM {table} WHERE {condition}", list(key.values()))
+        rows = cur.fetchall()
+        return rows[0] if len(rows) == 1 else None
 
     def _detect_editable(self, cur, result: QueryResult) -> None:
         """Renseigne `sources`/`keys` : quelles colonnes du résultat sont modifiables.

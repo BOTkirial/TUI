@@ -45,7 +45,7 @@ from .connections import (
     Connection,
     ConnectionStore,
 )
-from .drivers import ColumnSource, Database, QueryResult, RowUpdate, TableRef
+from .drivers import ColumnSource, Database, QueryResult, RowInsert, RowUpdate, TableRef
 from .dumpcmd import dump_command, restore_command
 
 DRIVERS = list(DEFAULT_PORTS)
@@ -88,6 +88,11 @@ def _to_text(value) -> str:
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=False)
     return str(value)
+
+
+def _default_cell() -> Text:
+    """Cellule d'une ligne ajoutée, pas encore saisie : valeur par défaut de la colonne."""
+    return Text("DEFAULT", style=NULL_STYLE)
 
 
 def _cell(value, edited: bool = False) -> Text:
@@ -550,15 +555,20 @@ class CellEditor(ModalScreen[CellValue | None]):
 
     BINDINGS = [Binding("escape", "cancel", "Annuler")]
 
-    def __init__(self, source: ColumnSource, value: str | None):
+    def __init__(self, source: ColumnSource, value: str | None, is_default: bool = False):
         super().__init__()
         self._source = source
         self._value = value
+        # cellule d'une ligne ajoutée jamais saisie : valeur par défaut de la colonne
+        self._is_default = is_default
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
             yield Label(Text(self._source.label), classes="section")
-            current = "NULL" if self._value is None else "valeur"
+            if self._is_default:
+                current = "DEFAULT"
+            else:
+                current = "NULL" if self._value is None else "valeur"
             yield Label(
                 f"Actuellement : {current} · Entrée valider · shift+Entrée saut de ligne",
                 classes="hint",
@@ -610,6 +620,8 @@ class QueryScreen(Screen):
     BINDINGS = [
         Binding("ctrl+r", "run", "Exécuter"),
         Binding("ctrl+s", "save", "Enregistrer"),
+        Binding("ctrl+n", "new_row", "Nouvelle ligne"),
+        Binding("delete", "delete_row", "Supprimer la ligne"),
         # Échap : vide le filtre s'il est rempli, sinon retour aux connexions
         Binding("escape", "escape", "Filtre / Connexions"),
         Binding("ctrl+b", "databases", "Bases"),
@@ -635,6 +647,10 @@ class QueryScreen(Screen):
         # (ligne, colonne) -> nouvelle valeur (None = NULL)
         self._result: QueryResult | None = None
         self._edits: dict[tuple[int, int], str | None] = {}
+        # lignes ajoutées (index dans _result.rows), insérées au prochain ctrl+s
+        self._new_rows: set[int] = set()
+        # enregistrement ou suppression en cours : les index de lignes doivent rester valides
+        self._writing = False
         # True une fois l'utilisateur averti que ses modifications seront perdues
         self._discard_warned = False
 
@@ -679,7 +695,7 @@ class QueryScreen(Screen):
         self.action_run()
 
     def on_results_table_edit_requested(self, event: ResultsTable.EditRequested) -> None:
-        self._edit_cell(event.coordinate.row, event.coordinate.column)
+        self._edit_cell(self._row_at(event.coordinate), event.coordinate.column)
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         # clic sur une table -> SELECT prêt à l'emploi
@@ -773,6 +789,9 @@ class QueryScreen(Screen):
         # choix de la base : MySQL/MariaDB seulement (masqué du pied de page sinon)
         if action == "databases":
             return self._db.has_databases
+        # Suppr : seulement sur le tableau de résultats (masqué du pied de page sinon)
+        if action == "delete_row":
+            return self._result is not None and self.focused is self.query_one("#results")
         return True
 
     def action_databases(self) -> None:
@@ -820,6 +839,8 @@ class QueryScreen(Screen):
         table.clear(columns=True)
         self._result = result if result.columns else None
         self._edits.clear()
+        self._new_rows.clear()
+        self.refresh_bindings()
         if result.columns:
             # clés = index : survivent aux noms de colonnes en double
             for i, name in enumerate(result.columns):
@@ -852,6 +873,7 @@ class QueryScreen(Screen):
         if isinstance(original, (bytes, bytearray, memoryview)):
             self.app.notify("Valeur binaire : édition non supportée", severity="warning")
             return
+        is_new = row in self._new_rows
         if (row, col) in self._edits:
             current = self._edits[(row, col)]
         else:
@@ -861,7 +883,8 @@ class QueryScreen(Screen):
             # le résultat a pu être remplacé pendant que la modale était ouverte
             if edit is None or self._result is not result:
                 return
-            unchanged = (
+            # ligne ajoutée : toute saisie compte (NULL explicite ≠ valeur par défaut)
+            unchanged = not is_new and (
                 edit.value is None if original is None else edit.value == _to_text(original)
             )
             if unchanged:
@@ -875,30 +898,172 @@ class QueryScreen(Screen):
             )
             self._show_pending()
 
-        self.app.push_screen(CellEditor(source, current), done)
+        is_default = is_new and (row, col) not in self._edits
+        self.app.push_screen(CellEditor(source, current, is_default), done)
+
+    def action_new_row(self) -> None:
+        """Ajoute une ligne vide en fin de résultat, insérée au prochain ctrl+s."""
+        result = self._result
+        if result is None or len(result.keys) != 1:
+            self.app.notify(
+                "Ajout impossible : le résultat doit venir d'une seule table "
+                "dont la clé primaire figure dans le résultat",
+                severity="warning",
+            )
+            return
+        row = len(result.rows)
+        result.rows.append((None,) * len(result.columns))
+        self._new_rows.add(row)
+        self._discard_warned = False
+        table = self.query_one("#results", DataTable)
+        # colonnes calculées (hors table) : vides, non modifiables
+        table.add_row(
+            *(_default_cell() if source else Text("") for source in result.sources),
+            key=str(row),
+        )
+        first = next(i for i, source in enumerate(result.sources) if source)
+        table.move_cursor(row=row, column=first)
+        table.focus()
+        self._show_pending()
+
+    def _row_at(self, coordinate: Coordinate) -> int:
+        """Index dans `_result.rows` de la ligne affichée à `coordinate`.
+
+        Clé de ligne = index : reste juste après le retrait d'une ligne du tableau
+        (l'entrée de `_result.rows` est alors simplement inutilisée).
+        """
+        table = self.query_one("#results", DataTable)
+        return int(table.coordinate_to_cell_key(coordinate).row_key.value)
+
+    def action_delete_row(self) -> None:
+        """Retire une ligne ajoutée, ou supprime en base la ligne courante (après confirmation)."""
+        result = self._result
+        table = self.query_one("#results", DataTable)
+        if result is None or not table.row_count:
+            return
+        if self._writing:
+            self.app.notify("Enregistrement en cours, réessaie dans un instant", severity="warning")
+            return
+        row = self._row_at(table.cursor_coordinate)
+        if row in self._new_rows:
+            # pas encore en base : retrait local, sans confirmation
+            self._new_rows.discard(row)
+            self._remove_row(row)
+            self._show_pending()
+            return
+        if len(result.keys) != 1:
+            self.app.notify(
+                "Suppression impossible : le résultat doit venir d'une seule table "
+                "dont la clé primaire figure dans le résultat",
+                severity="warning",
+            )
+            return
+        (ref, key_indexes), = result.keys.items()
+        # clé = valeurs d'origine, même si la clé primaire est en cours de modification
+        key = {result.sources[i].column: result.rows[row][i] for i in key_indexes}
+        described = ", ".join(f"{col} = {_to_text(value)}" for col, value in key.items())
+        pending = sum(1 for r, _ in self._edits if r == row)
+        warning = f"\n{pending} modification(s) non enregistrée(s) perdue(s)." if pending else ""
+
+        def done(confirmed: bool | None) -> None:
+            # le résultat a pu être remplacé pendant que la modale était ouverte
+            if not confirmed or self._result is not result or self._writing:
+                return
+            self._writing = True
+            self._set_status("⏳ Suppression…")
+            self._delete(result, row, ref, key)
+
+        self.app.push_screen(
+            ConfirmPrompt(
+                f"Supprimer la ligne {ref[0]}.{ref[1]} ({described}) ?{warning}", "Supprimer"
+            ),
+            done,
+        )
+
+    @work(thread=True)
+    def _delete(self, result: QueryResult, row: int, ref: TableRef, key: dict) -> None:
+        try:
+            self._db.delete_row(ref, key)
+        except Exception as exc:
+            call_ui(self, self._write_failed, f"✗ Rien n'a été supprimé : {exc}")
+            return
+        call_ui(self, self._deleted, result, row)
+
+    def _deleted(self, result: QueryResult, row: int) -> None:
+        self._writing = False
+        if self._result is not result:
+            return
+        self._remove_row(row)
+        pending = self._pending_label()
+        self._set_status("✓ Ligne supprimée" + (f" — {pending} en attente" if pending else ""))
+
+    def _write_failed(self, message: str) -> None:
+        self._writing = False
+        self._set_status(message)
+
+    def _remove_row(self, row: int) -> None:
+        """Retire la ligne du tableau et ses modifications en attente."""
+        for cell in [cell for cell in self._edits if cell[0] == row]:
+            del self._edits[cell]
+        table = self.query_one("#results", DataTable)
+        coordinate = table.cursor_coordinate
+        table.remove_row(str(row))
+        # curseur sur la ligne suivante (ou la précédente en fin de tableau)
+        if table.row_count:
+            table.move_cursor(row=min(coordinate.row, table.row_count - 1), column=coordinate.column)
+
+    def _pending_label(self) -> str:
+        parts = []
+        if self._edits:
+            parts.append(f"{len(self._edits)} cellule(s) modifiée(s)")
+        if self._new_rows:
+            parts.append(f"{len(self._new_rows)} ligne(s) ajoutée(s)")
+        return ", ".join(parts)
 
     def _show_pending(self) -> None:
-        if self._edits:
-            self._set_status(f"✎ {len(self._edits)} cellule(s) modifiée(s) — ctrl+s pour enregistrer")
+        if self._edits or self._new_rows:
+            self._set_status(f"✎ {self._pending_label()} — ctrl+s pour enregistrer")
         else:
             self._set_status("Aucune modification en attente")
 
     def _confirm_discard(self) -> bool:
         """Faut-il continuer malgré des modifications non enregistrées ? (avertit une fois)"""
-        if not self._edits or self._discard_warned:
+        if not (self._edits or self._new_rows) or self._discard_warned:
             return True
         self._discard_warned = True
         self.app.notify(
-            f"{len(self._edits)} cellule(s) non enregistrée(s) : ctrl+s pour enregistrer, "
+            f"{self._pending_label()} non enregistrée(s) : ctrl+s pour enregistrer, "
             "ou recommence pour les abandonner",
             severity="warning",
         )
         return False
 
+    def _build_inserts(
+        self, result: QueryResult, edits: dict, new_rows: list[int]
+    ) -> list[RowInsert]:
+        """Un INSERT par ligne ajoutée, avec les seules cellules saisies."""
+        (table, key_indexes), = result.keys.items()
+        returning = [s.column for s in result.sources if s]
+        key = [result.sources[i].column for i in key_indexes]
+        return [
+            RowInsert(
+                table=table,
+                values={
+                    result.sources[col].column: value
+                    for (r, col), value in sorted(edits.items()) if r == row
+                },
+                returning=returning,
+                key=key,
+            )
+            for row in new_rows
+        ]
+
     def _build_updates(self, result: QueryResult, edits: dict) -> list[RowUpdate]:
         """Regroupe les cellules modifiées en un UPDATE par (ligne, table)."""
         grouped: dict[tuple[int, TableRef], dict[str, str | None]] = {}
         for (row, col), value in sorted(edits.items()):
+            if row in self._new_rows:  # insérée, pas mise à jour
+                continue
             source = result.sources[col]
             grouped.setdefault((row, source.table), {})[source.column] = value
         updates = []
@@ -909,38 +1074,79 @@ class QueryScreen(Screen):
         return updates
 
     def action_save(self) -> None:
-        if self._result is None or not self._edits:
+        result = self._result
+        if result is None or not (self._edits or self._new_rows):
             self.app.notify("Aucune modification à enregistrer")
             return
+        if self._writing:
+            self.app.notify("Enregistrement en cours, réessaie dans un instant", severity="warning")
+            return
+        self._writing = True
         edits = dict(self._edits)
+        new_rows = sorted(self._new_rows)
         self._set_status("⏳ Enregistrement…")
-        self._save(self._result, edits, self._build_updates(self._result, edits))
+        self._save(
+            result, edits, new_rows,
+            self._build_updates(result, edits),
+            self._build_inserts(result, edits, new_rows) if new_rows else [],
+        )
 
     @work(thread=True, exclusive=True)
-    def _save(self, result: QueryResult, edits: dict, updates: list[RowUpdate]) -> None:
+    def _save(
+        self, result: QueryResult, edits: dict, new_rows: list[int],
+        updates: list[RowUpdate], inserts: list[RowInsert],
+    ) -> None:
         try:
-            self._db.apply_updates(updates)
+            inserted = self._db.apply_updates(updates, inserts)
         except Exception as exc:
-            call_ui(self, self._set_status, f"✗ Rien n'a été enregistré : {exc}")
+            call_ui(self, self._write_failed, f"✗ Rien n'a été enregistré : {exc}")
             return
-        call_ui(self, self._saved, result, edits, len(updates))
+        call_ui(self, self._saved, result, edits, len(updates), dict(zip(new_rows, inserted)))
 
-    def _saved(self, result: QueryResult, edits: dict, count: int) -> None:
+    def _saved(
+        self, result: QueryResult, edits: dict, count: int, inserted: dict[int, tuple | None]
+    ) -> None:
+        self._writing = False
         # les valeurs enregistrées deviennent les valeurs d'origine des lignes
         for (row, col), value in edits.items():
             values = list(result.rows[row])
             values[col] = value
             result.rows[row] = tuple(values)
+        # lignes insérées : valeurs relues en base (clé générée, valeurs par défaut)
+        editable = [i for i, source in enumerate(result.sources) if source]
+        lost = 0
+        for row, read_back in inserted.items():
+            if read_back is None:
+                lost += 1
+                continue
+            values = list(result.rows[row])
+            for i, value in zip(editable, read_back):
+                values[i] = value
+            result.rows[row] = tuple(values)
         if self._result is not result:
             return
         table = self.query_one("#results", DataTable)
+        self._new_rows -= inserted.keys()
+        for row in inserted:
+            for col in editable:
+                if (row, col) not in edits:
+                    table.update_cell(str(row), str(col), _cell(result.rows[row][col]))
         for cell, value in edits.items():
             # une cellule ressaisie pendant l'enregistrement reste en attente
             if cell in self._edits and self._edits[cell] == value:
                 del self._edits[cell]
-                table.update_cell(str(cell[0]), str(cell[1]), _cell(value))
-        suffix = f" — {len(self._edits)} cellule(s) encore en attente" if self._edits else ""
-        self._set_status(f"✓ {count} ligne(s) mise(s) à jour{suffix}")
+                table.update_cell(str(cell[0]), str(cell[1]), _cell(result.rows[cell[0]][cell[1]]))
+        done = [f"{count} ligne(s) mise(s) à jour"] if count or not inserted else []
+        if inserted:
+            done.append(f"{len(inserted)} ligne(s) ajoutée(s)")
+        pending = self._pending_label()
+        suffix = f" — {pending} encore en attente" if pending else ""
+        self._set_status(f"✓ {', '.join(done)}{suffix}")
+        if lost:
+            self.app.notify(
+                f"{lost} ligne(s) ajoutée(s) non relue(s) : relance la requête avant de les modifier",
+                severity="warning",
+            )
 
     def _set_status(self, text: str) -> None:
         # Text : les messages d'erreur des pilotes ne sont pas du markup
