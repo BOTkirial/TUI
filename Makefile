@@ -1,5 +1,9 @@
 .PHONY: up down build http sql docker logs
 
+# docker exec et non « compose exec » : sa séquence de détachement par défaut
+# (ctrl-p,ctrl-q) retient chaque ctrl+p jusqu'à la touche suivante (palette).
+RUN = docker exec -it --detach-keys=ctrl-^,ctrl-^ $$(docker compose ps -q tui)
+
 up:            ## démarre le conteneur TUI
 	docker compose up -d
 
@@ -10,13 +14,13 @@ build:         ## (re)construit l'image des TUI
 	docker compose build
 
 http: up       ## ouvre le client HTTP
-	docker compose exec tui http-tui
+	$(RUN) http-tui
 
 sql: up        ## ouvre le client SQL
-	docker compose exec tui sql-tui
+	$(RUN) sql-tui
 
 docker: up     ## ouvre le client Docker
-	docker compose exec tui docker-tui
+	$(RUN) docker-tui
 
 logs:          ## logs du conteneur TUI
 	docker compose logs -f tui

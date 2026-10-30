@@ -37,7 +37,8 @@ Puis, **depuis le terminal intégré de Zed** (ouvert à la racine du projet) :
 ```
 
 Ces lanceurs démarrent la stack si besoin, puis entrent dans le conteneur via
-`docker compose exec`. Équivalents `make` : `make http`, `make sql`, `make docker`, `make down`.
+`docker exec` (pas `docker compose exec`, dont la séquence de détachement
+`ctrl-p,ctrl-q` retiendrait chaque `ctrl+p` destiné à la palette). Équivalents `make` : `make http`, `make sql`, `make docker`, `make down`.
 
 > **Pourquoi `exec` et pas `docker compose up` seul ?** Un `up` multiplexe les
 > logs de tous les services et ne câble pas un vrai TTY sur une TUI précise.

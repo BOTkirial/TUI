@@ -3,4 +3,6 @@
 set -e
 cd "$(dirname "$0")"
 docker compose up -d
-exec docker compose exec tui sql-tui
+# docker exec et non « compose exec » : sa séquence de détachement par défaut
+# (ctrl-p,ctrl-q) retient chaque ctrl+p jusqu'à la touche suivante (palette).
+exec docker exec -it --detach-keys=ctrl-^,ctrl-^ "$(docker compose ps -q tui)" sql-tui

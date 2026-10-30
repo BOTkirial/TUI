@@ -10,7 +10,7 @@ Trois applications terminal en Python + Textual (client HTTP `http-tui`, client 
 
 ```bash
 docker compose up -d          # build image + conteneur `tui` (network_mode: host)
-./http   |  make http         # démarre la stack si besoin puis `docker compose exec tui http-tui`
+./http   |  make http         # démarre la stack si besoin puis `docker exec … tui http-tui` (--detach-keys : voir plus bas)
 ./sql    |  make sql          # lance le client SQL
 ./dock   |  make docker       # lance le client Docker
 make build                    # reconstruire l'image après modification du code (le code est COPIÉ, pas monté)
@@ -23,6 +23,8 @@ cd workspace/sql  && sql-tui
 ```
 
 Aucune suite de tests ni linter configurés.
+
+Les lanceurs (scripts et Makefile) utilisent `docker exec -it --detach-keys=ctrl-^,ctrl-^ <conteneur>` et non `docker compose exec` : la séquence de détachement par défaut `ctrl-p,ctrl-q` retient chaque `ctrl+p` (palette) jusqu'à la touche suivante, et `compose exec` n'a pas d'option `--detach-keys`.
 
 Important : dans Docker, `workspace/` est monté sur `/work` (plus, pour docker-tui, le socket Docker et `$HOME` en lecture seule au même chemin). Le conteneur `tui` est en `network_mode: host` : `localhost` y désigne la machine hôte (bases locales accessibles telles quelles). Toute modification du code Python exige `make build` puis relancer le conteneur.
 
