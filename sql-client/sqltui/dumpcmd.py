@@ -104,6 +104,9 @@ def _host_key_path(path: str) -> str:
     # chemin vu dans le conteneur (/root/.ssh monté depuis ~/.ssh) -> chemin de l'hôte
     if path.startswith("/root/.ssh/"):
         path = "~/.ssh/" + path.removeprefix("/root/.ssh/")
+    # nom seul (`id_rsa`) : cherché dans ~/.ssh, comme pour le tunnel (resolve_key_path)
+    elif "/" not in path:
+        path = "~/.ssh/" + path
     if path.startswith("~/"):
         return "~/" + shlex.quote(path[2:])
     return shlex.quote(path)

@@ -1,0 +1,18 @@
+# contexte de build : seuls pyproject.toml et le code des paquets sont copiés
+# (voir Dockerfile) ; le reste alourdit le contexte et invalide le cache
+.git
+.gitignore
+workspace/
+**/__pycache__
+**/*.pyc
+*.egg-info
+**/*.egg-info
+build/
+dist/
+.venv/
+venv/
+.claude/
+# secrets locaux, jamais dans l'image
+**/.env
+**/.env.*
+**/*.postman_collection.json

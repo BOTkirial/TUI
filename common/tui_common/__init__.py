@@ -1,7 +1,7 @@
 """Briques partagées entre les TUI (HTTP, SQL, Docker)."""
 
 from .baseapp import COMMON_CSS, BaseApp
-from .clipboard import to_clipboard, osc52_copy
+from .clipboard import to_clipboard
 from .dialogs import ConfirmPrompt
 from .tables import AutoWidthTable, CopyTable
 from .textfilter import matches
@@ -15,6 +15,5 @@ __all__ = [
     "ConfirmPrompt",
     "call_ui",
     "to_clipboard",
-    "osc52_copy",
     "matches",
 ]

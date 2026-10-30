@@ -31,6 +31,7 @@ from textual.widgets import (
     Tree,
 )
 from textual.widgets.tree import TreeNode
+from textual.worker import Worker, get_current_worker
 
 from tui_common import COMMON_CSS, BaseApp, ConfirmPrompt, CopyTable, call_ui, matches
 
@@ -46,6 +47,10 @@ STATE_STYLES = {
     "restarting": "yellow",
     "created": "dim",
 }
+
+# fins de ligne des logs : « \r » seul compte aussi (barres de progression,
+# qui réécrivent leur ligne sans jamais envoyer « \n »)
+_LINE_END = re.compile(rb"\r\n|[\r\n]")
 
 # séquences de contrôle d'une ligne de log : échappements ANSI complets (CSI, OSC,
 # ESC + 1 caractère) puis caractères de contrôle isolés (tabulation conservée)
@@ -84,6 +89,8 @@ class LogScreen(Screen):
     # lignes en attente au plus : au-delà, les plus anciennes sont sautées
     # pour que l'affichage ne prenne jamais de retard
     _MAX_PENDING = 500
+    # ligne sans fin au-delà de cette taille : affichée telle quelle (mémoire bornée)
+    _MAX_LINE = 65536
 
     def __init__(self, target: Container | Stack):
         super().__init__()
@@ -118,7 +125,7 @@ class LogScreen(Screen):
     def on_unmount(self) -> None:
         self._closing = True
         if self._proc is not None:
-            self._proc.terminate()
+            engine.stop_logs(self._proc)
 
     def _set_status(self, text: str) -> None:
         self.query_one("#status", Static).update(Text(text))
@@ -128,12 +135,12 @@ class LogScreen(Screen):
         try:
             proc = engine.follow_logs(self._target)
         except DockerError as exc:
-            call_ui(self, self._set_status, f"✗ {exc}")
+            call_ui(self, self._set_status, f"✗ {exc.tail()}")
             return
         self._proc = proc
         # écran fermé entre le lancement et l'affectation : on_unmount n'a pas vu le processus
         if self._closing:
-            proc.terminate()
+            engine.stop_logs(proc)
             return
         call_ui(self, self._set_status, "● Flux en direct")
         # lecture par blocs : découper des octets coûte peu, le décodage n'est fait
@@ -142,7 +149,14 @@ class LogScreen(Screen):
         fd = proc.stdout.fileno()
         rest = b""
         while chunk := os.read(fd, 65536):
-            *lines, rest = (rest + chunk).split(b"\n")
+            data = rest + chunk
+            # « \r » final : peut-être la 1re moitié d'un « \r\n », tranché au bloc suivant
+            cut = len(data) - 1 if data.endswith(b"\r") else len(data)
+            *lines, rest = _LINE_END.split(data[:cut])
+            rest += data[cut:]
+            if len(rest) > self._MAX_LINE:
+                lines.append(rest)
+                rest = b""
             if lines:
                 with self._lock:
                     overflow = len(self._pending) + len(lines) - self._MAX_PENDING
@@ -244,7 +258,7 @@ class InspectScreen(Screen):
             output = engine.inspect(self._target)
         except DockerError as exc:
             # écran peut-être fermé avant la réponse de docker : call_ui
-            call_ui(self, self._set_status, f"✗ {exc}")
+            call_ui(self, self._set_status, f"✗ {exc.tail()}")
             return
         call_ui(self, self._show, output)
 
@@ -451,8 +465,10 @@ class ResourcePane(FilterPane):
         rows = [(item, self.cells(item)) for item in self._items]
         found = [(item, cells) for item, cells in rows if matches(self.filter_text(item, cells), terms)]
         if self._sort is not None:
-            column, reverse = self._sort
-            found.sort(key=lambda row: self.sort_value(row[0], column, row[1]), reverse=reverse)
+            sort_column, reverse = self._sort
+            found.sort(
+                key=lambda row: self.sort_value(row[0], sort_column, row[1]), reverse=reverse
+            )
         self._visible = [item for item, _ in found]
         # colonnes recréées : leur libellé porte l'indicateur de tri
         table.clear(columns=True)
@@ -557,9 +573,11 @@ class ImagesPane(ResourcePane):
         ]
 
     def sort_value(self, item: Image, column: int, cells: list[str]):
-        if column == 3:
+        # tri sur la valeur réelle, pas sur le texte affiché (« 1.2GB », « 2 weeks ago »)
+        title = self.columns[column][0]
+        if title == "Taille":
             return _size_bytes(item.size)
-        if column == 4:
+        if title == "Créée":
             return item.created_at
         return super().sort_value(item, column, cells)
 
@@ -630,9 +648,12 @@ class ContainersPane(FilterPane):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self._snapshot: Snapshot | None = None
-        # stacks repliées hors filtre (le filtre déplie tout, on restaure ensuite)
+        # stacks repliées hors filtre (le filtre déplie tout, on restaure ensuite) ;
+        # une stack masquée (filtre, « En route uniquement ») garde son état
         self._collapsed: set[str] = set()
         self._filtering = False
+        # conteneur qui exécute cette TUI ("" hors Docker) : ses actions l'arrêteraient
+        self._own_id = engine.own_container_id()
 
     def compose(self) -> ComposeResult:
         with Horizontal(classes="filter-row"):
@@ -666,21 +687,24 @@ class ContainersPane(FilterPane):
         self._snapshot = snapshot
         self.refresh_view()
 
-    def _collapsed_stacks(self) -> set[str]:
-        """Stacks repliées hors filtre (pendant un filtre : l'état d'avant)."""
+    def _remember_collapsed(self) -> None:
+        """Met à jour `_collapsed` d'après les stacks affichées ; les autres
+        (absentes de l'arbre) gardent leur état. Pendant un filtre, tout est
+        déplié : l'état d'avant le filtre est conservé tel quel."""
         if self._filtering:
-            return self._collapsed
-        return {
-            _node_key(node) for node in self.list_widget.root.children
-            if not node.is_expanded
-        }
+            return
+        for node in self.list_widget.root.children:
+            if node.is_expanded:
+                self._collapsed.discard(_node_key(node))
+            else:
+                self._collapsed.add(_node_key(node))
 
     def refresh_view(self, filter_changed: bool = False) -> None:
         if self._snapshot is None:
             return
         terms = self.filter_terms()
         filtering = bool(terms)
-        self._collapsed = self._collapsed_stacks()
+        self._remember_collapsed()
         self._filtering = filtering
         node = self.list_widget.cursor_node
         keep = _node_key(node) if node is not None else None
@@ -730,20 +754,24 @@ class ContainersPane(FilterPane):
         nodes = list(_iter_nodes(tree.root))
         target = next((n for n in nodes if _node_key(n) == key), None) if key else None
         if target is not None and target.parent is not None:
+            # l'élément qui avait le curseur reste visible (le filtre vidé, sa stack
+            # repliée se déplie) ; les replis de secours ci-dessous ne déplient rien
             target.parent.expand()
-        # Tree calcule les lignes paresseusement : lire last_line force ce calcul,
-        # sinon node.line vaut encore -1 et le curseur tombe sur la 1re ligne
+        # Tree calcule les lignes paresseusement (après le expand() ci-dessus aussi) :
+        # lire last_line force ce calcul, sinon node.line vaut encore -1 et le
+        # curseur tombe sur la 1re ligne
         last_line = tree.last_line
         if target is None and fallback_line is not None and fallback_line >= 0 and last_line >= 0:
             target = tree.get_node_at_line(min(fallback_line, last_line))
         if target is None:
-            target = next((n for n in nodes if isinstance(n.data, Container)), None)
+            # 1er conteneur visible, sinon 1re stack (repliée, laissée telle quelle)
+            target = next(
+                (n for n in nodes if isinstance(n.data, Container) and n.parent.is_expanded),
+                next(iter(tree.root.children), None),
+            )
         if target is None:
             self._show_detail(None)
             return
-        if target.parent is not None and not target.parent.is_expanded:
-            target.parent.expand()
-            tree.last_line
         tree.move_cursor(target)
         self._show_detail(target)
 
@@ -785,37 +813,60 @@ class ContainersPane(FilterPane):
             self.app.push_screen(LogScreen(data))
         elif action == "inspect" and isinstance(data, (Stack, Container)):
             self.app.push_screen(InspectScreen(data))
-        elif isinstance(data, Stack):
-            if action == "down":
-                self.app.push_screen(
-                    ConfirmPrompt(
+        elif isinstance(data, (Stack, Container)):
+            # question = confirmation demandée avant de lancer (None = aucune)
+            question: str | None = None
+            ok_label = action.capitalize()
+            if isinstance(data, Stack):
+                label, func = f"compose {action} {data.name}", engine.compose
+                args = {"up": ("up", "-d"), "stop": ("stop",), "down": ("down",)}[action]
+                args = (data, *args)
+                if action == "down":
+                    question = (
                         f"docker compose down sur la stack « {data.name} » ?\n"
-                        "Ses conteneurs et réseaux seront supprimés (pas les volumes).",
-                        "Down",
-                    ),
-                    lambda ok: ok and screen.run_docker(
-                        f"compose down {data.name}", engine.compose, data, "down"
-                    ),
-                )
+                        "Ses conteneurs et réseaux seront supprimés (pas les volumes)."
+                    )
             else:
-                args = ("up", "-d") if action == "up" else ("stop",)
-                screen.run_docker(f"compose {action} {data.name}", engine.compose, data, *args)
-        elif isinstance(data, Container):
-            if action == "up":
-                screen.run_docker(f"start {data.name}", engine.start_container, data)
-            elif action == "stop":
-                screen.run_docker(f"stop {data.name}", engine.stop_container, data)
+                command, func = {
+                    "up": ("start", engine.start_container),
+                    "stop": ("stop", engine.stop_container),
+                    "down": ("rm", engine.remove_container),
+                }[action]
+                label, args = f"{command} {data.name}", (data,)
+                if action == "down":
+                    question = f"Supprimer le conteneur « {data.name} » ?"
+                    ok_label = "Supprimer"
+            # démarrer le conteneur de la TUI (déjà en route) est sans effet ;
+            # tout le reste peut l'arrêter (compose up le recrée si sa config a changé)
+            if self._runs_tui(data) and not (action == "up" and isinstance(data, Container)):
+                where = "cette stack" if isinstance(data, Stack) else "ce conteneur"
+                effect = (
+                    "elle sera arrêtée si son conteneur est recréé" if action == "up"
+                    else "elle sera arrêtée"
+                )
+                question = (
+                    f"{question or f'docker {label} ?'}\n\n"
+                    f"⚠ Cette TUI s'exécute dans {where} : {effect}."
+                )
+            if question is None:
+                screen.run_docker(label, func, *args)
             else:
                 self.app.push_screen(
-                    ConfirmPrompt(f"Supprimer le conteneur « {data.name} » ?", "Supprimer"),
-                    lambda ok: ok and screen.run_docker(
-                        f"rm {data.name}", engine.remove_container, data
-                    ),
+                    ConfirmPrompt(question, ok_label),
+                    lambda ok: ok and screen.run_docker(label, func, *args),
                 )
         else:
             self.app.notify(
                 "Sélectionne une stack compose ou un conteneur", severity="warning"
             )
+
+
+    def _runs_tui(self, data: Stack | Container) -> bool:
+        """Vrai si la stack ou le conteneur est celui qui exécute cette TUI."""
+        if not self._own_id:
+            return False
+        containers = data.containers if isinstance(data, Stack) else [data]
+        return any(c.id == self._own_id for c in containers)
 
 
 def _iter_nodes(root: TreeNode):
@@ -934,14 +985,24 @@ class DockerScreen(Screen):
 
     @work(thread=True, exclusive=True, group="reload")
     def _load(self) -> None:
+        worker = get_current_worker()
         try:
             snap = engine.snapshot()
         except DockerError as exc:
-            self.app.call_from_thread(self._set_status, f"✗ Docker inaccessible : {exc}")
+            call_ui(self, self._load_failed, worker, exc)
             return
-        self.app.call_from_thread(self._apply, snap)
+        call_ui(self, self._apply, worker, snap)
 
-    def _apply(self, snap: Snapshot) -> None:
+    # Rechargement relancé avant la fin du précédent : `exclusive` annule l'ancien
+    # worker mais un thread ne s'interrompt pas, il finit et rappelle l'UI. Le test
+    # est fait sur le thread UI, là où l'annulation a lieu (pas de course).
+    def _load_failed(self, worker: Worker, exc: DockerError) -> None:
+        if not worker.is_cancelled:
+            self._set_status(f"✗ Docker inaccessible : {exc.tail()}")
+
+    def _apply(self, worker: Worker, snap: Snapshot) -> None:
+        if worker.is_cancelled:
+            return  # instantané périmé : un rechargement plus récent est en cours
         self.query_one(ContainersPane).set_snapshot(snap)
         self.query_one(ImagesPane).set_items(snap.images)
         self.query_one(NetworksPane).set_items(snap.networks)
@@ -958,13 +1019,16 @@ class DockerScreen(Screen):
         try:
             func(*args)
         except DockerError as exc:
-            self.app.call_from_thread(self._set_status, f"✗ {label} : {exc}")
-            self.app.call_from_thread(
-                self.app.notify, str(exc), title=label, severity="error", timeout=8
-            )
+            # stderr complet de compose = surtout de la progression : la ligne
+            # d'état ne garde que la dernière ligne (l'erreur), la notification la fin
+            call_ui(self, self._set_status, f"✗ {label} : {exc.tail()}")
+            call_ui(self, self._notify_error, label, exc.tail(6))
         else:
-            self.app.call_from_thread(self._set_status, f"✓ {label}")
-        self.app.call_from_thread(self.action_reload)
+            call_ui(self, self._set_status, f"✓ {label}")
+        call_ui(self, self.action_reload)
+
+    def _notify_error(self, label: str, message: str) -> None:
+        self.app.notify(message, title=label, severity="error", timeout=8)
 
     # --- évènements ----------------------------------------------------------
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
@@ -1010,6 +1074,11 @@ class DockerTui(BaseApp):
 
     def on_mount(self) -> None:
         self.push_screen(DockerScreen())
+
+    def on_unmount(self) -> None:
+        # les workers thread sont attendus à la fermeture : sans ça, ctrl+q
+        # resterait bloqué jusqu'à la fin d'un `compose up` en cours
+        engine.kill_all()
 
 
 def main() -> None:

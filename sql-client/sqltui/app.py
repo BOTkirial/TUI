@@ -6,6 +6,8 @@ import json
 import os
 import threading
 from dataclasses import dataclass
+from datetime import timedelta
+from decimal import Decimal
 
 from rich.text import Text
 from textual import work
@@ -54,7 +56,8 @@ SSH_FIELDS = ("#f-ssh-host", "#f-ssh-port", "#f-ssh-user", "#f-ssh-password", "#
 # cellule modifiée mais pas encore enregistrée (ctrl+s)
 EDITED_STYLE = "bold black on yellow"
 NULL_STYLE = "dim italic"
-# lignes affichées au plus par résultat : au-delà, le tableau fige l'interface
+# lignes conservées et affichées au plus par résultat : au-delà, le tableau fige
+# l'interface (le pilote, lui, reçoit tout le résultat en mémoire)
 MAX_ROWS = 10_000
 
 
@@ -85,14 +88,47 @@ def _fill_list(options: OptionList, labels: list[str]) -> None:
 
 def _to_text(value) -> str:
     """Valeur SQL -> texte affiché et éditable (JSON réel plutôt que repr Python)."""
+    # listes : seulement json/jsonb, les tableaux Postgres arrivent déjà en littéral `{…}`
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, timedelta):
+        return _duration_text(value)
     return str(value)
+
+
+def _duration_text(value: timedelta) -> str:
+    """TIME MySQL / interval Postgres -> `[-]HH:MM:SS[.ffffff]`, relu tel quel par les deux.
+
+    (str(timedelta) donnerait `-1 day, 23:00:00` pour -01:00:00.)
+    """
+    sign = "-" if value < timedelta(0) else ""
+    micros = abs(value) // timedelta(microseconds=1)
+    seconds, micros = divmod(micros, 1_000_000)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    text = f"{sign}{hours:02}:{minutes:02}:{seconds:02}"
+    return f"{text}.{micros:06}" if micros else text
 
 
 def _default_cell() -> Text:
     """Cellule d'une ligne ajoutée, pas encore saisie : valeur par défaut de la colonne."""
     return Text("DEFAULT", style=NULL_STYLE)
+
+
+def _sort_key(value) -> tuple:
+    """Clé de tri d'une valeur non NULL : nombres (saisis compris) avant le texte."""
+    number = None
+    if isinstance(value, (int, float, Decimal)):
+        number = value
+    elif isinstance(value, str):
+        try:
+            number = Decimal(value.strip())
+        except ArithmeticError:  # InvalidOperation : pas un nombre
+            pass
+    # NaN : `<` lève une exception sur Decimal, trié comme du texte
+    if number is not None and not (isinstance(number, Decimal) and number.is_nan()):
+        return (0, number, "")
+    return (1, 0, _to_text(value).casefold())
 
 
 def _cell(value, edited: bool = False) -> Text:
@@ -253,9 +289,9 @@ class ConnectionForm(ModalScreen[Connection | None]):
         conn = self._read_form()
         if conn is None:
             return
-        # en modification, un renommage ne doit pas écraser une autre connexion
+        # création ou renommage : ne pas écraser une autre connexion du même nom
         original = self._existing.name if self._existing else None
-        if original is not None and conn.name != original and any(
+        if conn.name != original and any(
             c.name == conn.name for c in self.app.store.connections
         ):
             self.app.notify(f"Une connexion « {conn.name} » existe déjà", severity="error")
@@ -288,6 +324,9 @@ class ConnectionForm(ModalScreen[Connection | None]):
 
 class ConnectionScreen(Screen):
     """Écran plein d'accueil : gestion et choix de la connexion."""
+
+    # classe -short sur un terminal bas (moins de 30 lignes) : mise en page compacte
+    VERTICAL_BREAKPOINTS = [(0, "-short"), (30, "-tall")]
 
     BINDINGS = [
         Binding("ctrl+n", "new", "Nouvelle"),
@@ -429,7 +468,8 @@ class ConnectionScreen(Screen):
 
     def action_new(self) -> None:
         def done(conn: Connection | None) -> None:
-            if conn is None or not self._save_store(self.app.store.add, conn):  # remplace si même nom
+            # nom unique : vérifié par le formulaire
+            if conn is None or not self._save_store(self.app.store.add, conn):
                 return
             self._select_by_name(conn.name)
             self.app.notify(f"Connexion « {conn.name} » enregistrée")
@@ -486,9 +526,10 @@ class ConnectionScreen(Screen):
         db = Database(conn)
         try:
             db.connect()
-            # MySQL sans base : « No database selected » sur SHOW TABLES,
-            # on propose plutôt la liste des bases
-            if db.has_databases and not conn.database:
+            # sans base : on propose la liste des bases (MySQL : « No database
+            # selected » sur SHOW TABLES ; Postgres : la base de l'utilisateur,
+            # souvent vide)
+            if not conn.database:
                 tables, databases = None, db.list_databases()
             else:
                 tables, databases = db.list_tables(), None
@@ -510,15 +551,27 @@ class ConnectionScreen(Screen):
         workspace = os.environ.get("DBEAVER_WORKSPACE")
         try:
             imported = dbeaver.import_connections(workspace)
-        except (OSError, ValueError) as exc:  # data-sources.json illisible
+        except Exception as exc:  # data-sources.json illisible ou de structure inattendue
             self.app.notify(f"Import DBeaver impossible : {exc}", severity="error")
             return
         if not imported:
             self.app.notify("Aucune connexion DBeaver trouvée", severity="warning")
             return
-        if self._save_store(self.app.store.add, *imported):
+        # nom déjà présent : la connexion locale (peut-être retouchée depuis un
+        # import précédent) est conservée telle quelle, l'import ne l'écrase pas
+        existing = {c.name for c in self.app.store.connections}
+        new = [c for c in imported if c.name not in existing]
+        skipped = len(imported) - len(new)
+        if not new:
+            self.app.notify(
+                f"Aucune nouvelle connexion DBeaver : {skipped} déjà présente(s) (même nom)",
+                severity="warning",
+            )
+            return
+        if self._save_store(self.app.store.add, *new):
             self._refresh_connections()
-            self.app.notify(f"{len(imported)} connexion(s) importée(s) de DBeaver")
+            ignored = f", {skipped} ignorée(s) (nom déjà présent)" if skipped else ""
+            self.app.notify(f"{len(new)} connexion(s) importée(s) de DBeaver{ignored}")
 
 
 class SubmitTextArea(TextArea):
@@ -584,12 +637,17 @@ class CellEditor(ModalScreen[CellValue | None]):
         editor.focus()
         editor.select_all()
 
+    def _validate(self) -> None:
+        text = self.query_one("#cell-value", SubmitTextArea).text
+        # NULL / DEFAULT validé sans rien saisir : cellule inchangée, pas une chaîne vide
+        self.dismiss(None if not text and self._value is None else CellValue(text))
+
     def on_submit_text_area_submitted(self, event: SubmitTextArea.Submitted) -> None:
-        self.dismiss(CellValue(self.query_one("#cell-value", SubmitTextArea).text))
+        self._validate()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "ok":
-            self.dismiss(CellValue(self.query_one("#cell-value", SubmitTextArea).text))
+            self._validate()
         elif event.button.id == "null":
             self.dismiss(CellValue(None))
         else:
@@ -625,6 +683,7 @@ class QueryScreen(Screen):
         # Échap : vide le filtre s'il est rempli, sinon retour aux connexions
         Binding("escape", "escape", "Filtre / Connexions"),
         Binding("ctrl+b", "databases", "Bases"),
+        Binding("ctrl+f", "toggle_fullscreen", "Plein écran"),
         Binding("down", "cursor_down", show=False),
         Binding("up", "cursor_up", show=False),
     ]
@@ -636,11 +695,11 @@ class QueryScreen(Screen):
         # connexion ouverte, fermée quand l'écran est retiré (retour aux connexions)
         self._db = db
         self._tables = tables or []
-        # tables=None : pas de base courante (MySQL), la barre latérale liste les bases
+        # tables=None : pas de base choisie, la barre latérale liste les bases
         self._databases = databases or []
         self._choosing_db = tables is None
-        # base courante (MySQL : change avec ctrl+b), cible des commandes de dump
-        self._database = db.meta.database
+        # base courante (change avec ctrl+b), cible des commandes de dump
+        self._database = db.database
         # tables (ou bases) affichées après filtre, dans l'ordre de la liste
         self._visible: list[str] = []
         # dernier résultat affiché et modifications en attente :
@@ -649,8 +708,13 @@ class QueryScreen(Screen):
         self._edits: dict[tuple[int, int], str | None] = {}
         # lignes ajoutées (index dans _result.rows), insérées au prochain ctrl+s
         self._new_rows: set[int] = set()
-        # enregistrement ou suppression en cours : les index de lignes doivent rester valides
+        # tri des résultats (clic sur un en-tête) : (colonne, décroissant)
+        self._sort: tuple[int, bool] | None = None
+        # enregistrement ou suppression en cours : les index de lignes doivent rester
+        # valides, et la connexion ne doit être ni fermée ni changée de base entre-temps
         self._writing = False
+        # changement de base en cours (ctrl+b puis Entrée sur une base)
+        self._switching = False
         # True une fois l'utilisateur averti que ses modifications seront perdues
         self._discard_warned = False
 
@@ -667,13 +731,15 @@ class QueryScreen(Screen):
             with Vertical(id="workspace"):
                 yield Label(
                     "Requête SQL  —  Entrée pour exécuter · shift+Entrée pour un saut de ligne",
-                    classes="section",
+                    classes="section", id="query-title",
                 )
                 yield SubmitTextArea(
                     "SELECT 1;", id="query", language="sql", classes="editor-area framed"
                 )
                 yield ResultsTable(id="results", cursor_type="cell", classes="framed")
-                yield Static("", id="status")
+                with Horizontal(id="status-bar"):
+                    yield Static("", id="status")
+                    yield Button("Plein écran", id="fullscreen", compact=True)
         yield Footer()
 
     def on_mount(self) -> None:
@@ -745,6 +811,7 @@ class QueryScreen(Screen):
         )
 
     def _show_tables(self, database: str, tables: list[str]) -> None:
+        self._switching = False
         self._choosing_db = False
         self._database = database
         self._tables = tables
@@ -758,6 +825,17 @@ class QueryScreen(Screen):
             return
         if self._choosing_db:
             name = self._visible[index]
+            if self._writing or self._switching:
+                self.app.notify("Opération en cours, réessaie dans un instant", severity="warning")
+                return
+            if not self._db.table_refs_include_database:
+                # Postgres : les clés (schéma, table) du résultat viseraient la
+                # nouvelle base ; il est abandonné (avec ses modifications) avant
+                # le changement, pour qu'aucun enregistrement ne parte entre-temps
+                if not self._confirm_discard():
+                    return
+                self._show_result(QueryResult(columns=[], rows=[], rowcount=0), [])
+            self._switching = True
             self._set_status(f"⏳ Ouverture de la base {name}…")
             self._use_database(name)
             return
@@ -765,15 +843,20 @@ class QueryScreen(Screen):
         self.query_one("#query", TextArea).text = f"SELECT * FROM {table} LIMIT 100;"
         self.action_run()
 
-    @work(thread=True, exclusive=True, group="database")
+    @work(thread=True, group="database")
     def _use_database(self, name: str) -> None:
         try:
             self._db.use_database(name)
             tables = self._db.list_tables()
         except Exception as exc:
-            call_ui(self, self._set_status, f"✗ {exc}")
+            call_ui(self, self._switch_failed, f"✗ {exc}")
             return
         call_ui(self, self._show_tables, name, tables)
+
+    def _switch_failed(self, message: str) -> None:
+        # Postgres : l'ancienne connexion reste ouverte, base inchangée
+        self._switching = False
+        self._set_status(message)
 
     @work(thread=True, exclusive=True, group="database")
     def _load_databases(self) -> None:
@@ -786,23 +869,43 @@ class QueryScreen(Screen):
 
     # --- actions ---------------------------------------------------------
     def check_action(self, action: str, parameters: tuple) -> bool | None:
-        # choix de la base : MySQL/MariaDB seulement (masqué du pied de page sinon)
-        if action == "databases":
-            return self._db.has_databases
         # Suppr : seulement sur le tableau de résultats (masqué du pied de page sinon)
         if action == "delete_row":
             return self._result is not None and self.focused is self.query_one("#results")
         return True
 
     def action_databases(self) -> None:
+        # plein écran : la barre latérale (liste des bases) doit redevenir visible
+        if self.has_class("-results-full"):
+            self.action_toggle_fullscreen()
         self._set_status("⏳ Lecture des bases…")
         self._load_databases()
 
     def action_back(self) -> None:
+        # quitter l'écran ferme la connexion : pas au milieu d'un enregistrement
+        if self._writing:
+            self.app.notify("Enregistrement en cours, réessaie dans un instant", severity="warning")
+            return
         if self._confirm_discard():
             self.app.pop_screen()
 
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "fullscreen":
+            self.action_toggle_fullscreen()
+
+    def action_toggle_fullscreen(self) -> None:
+        """Résultats seuls à l'écran (barre des tables et éditeur masqués), ou retour."""
+        full = self.toggle_class("-results-full").has_class("-results-full")
+        self.query_one("#fullscreen", Button).label = "Réduire" if full else "Plein écran"
+        # le focus ne peut pas rester sur un widget masqué (filtre, éditeur)
+        if full:
+            self.query_one("#results", DataTable).focus()
+
     def action_escape(self) -> None:
+        # plein écran : Échap rétablit d'abord la vue complète
+        if self.has_class("-results-full"):
+            self.action_toggle_fullscreen()
+            return
         filter_input = self.query_one("#table-filter", Input)
         if filter_input.value:
             filter_input.value = ""
@@ -818,21 +921,40 @@ class QueryScreen(Screen):
     def action_run(self) -> None:
         editor = self.query_one("#query", TextArea)
         sql = editor.selected_text or editor.text
-        if not sql.strip() or not self._confirm_discard():
+        if not sql.strip():
+            return
+        # le résultat affiché (index de lignes) est utilisé par l'écriture en cours
+        if self._writing or self._switching:
+            self.app.notify("Opération en cours, réessaie dans un instant", severity="warning")
+            return
+        if not self._confirm_discard():
             return
         self._set_status("⏳ Exécution…")
         self._run_query(sql)
 
-    @work(thread=True, exclusive=True)
+    # exclusive : marque la requête précédente comme annulée, sans arrêter son
+    # thread ; le verrou de Database les exécute l'une après l'autre
+    @work(thread=True, exclusive=True, group="query")
     def _run_query(self, sql: str) -> None:
         try:
             result = self._db.execute(sql, max_rows=MAX_ROWS)
         except Exception as exc:
-            call_ui(self, self._set_status, f"✗ {exc}")
+            if not get_current_worker().is_cancelled:
+                call_ui(self, self._set_status, f"✗ {exc}")
+            return
+        # relancée entre-temps : seule la dernière requête est affichée
+        if get_current_worker().is_cancelled:
             return
         # conversion en texte dans le worker, pas sur le thread UI
         cells = [[_cell(v) for v in row] for row in result.rows]
-        call_ui(self, self._show_result, result, cells)
+        call_ui(self, self._query_done, result, cells)
+
+    def _query_done(self, result: QueryResult, cells: list[list[Text]]) -> None:
+        # base changée pendant l'exécution : résultat (et ses clés) d'une autre base
+        if self._switching or result.database != self._database:
+            self._set_status("✗ Base changée pendant l'exécution, relance la requête")
+            return
+        self._show_result(result, cells)
 
     def _show_result(self, result: QueryResult, cells: list[list[Text]]) -> None:
         table = self.query_one("#results", DataTable)
@@ -840,11 +962,10 @@ class QueryScreen(Screen):
         self._result = result if result.columns else None
         self._edits.clear()
         self._new_rows.clear()
+        self._sort = None
         self.refresh_bindings()
         if result.columns:
-            # clés = index : survivent aux noms de colonnes en double
-            for i, name in enumerate(result.columns):
-                table.add_column(name, key=str(i))
+            self._add_columns(result)
             for i, row in enumerate(cells):
                 table.add_row(*row, key=str(i))
             editable = "modifiable (Entrée sur une cellule)" if result.keys else "lecture seule"
@@ -855,6 +976,56 @@ class QueryScreen(Screen):
             self._set_status(f"✓ {count} — {editable}")
         else:
             self._set_status(f"✓ {result.message}")
+
+    def _add_columns(self, result: QueryResult) -> None:
+        table = self.query_one("#results", DataTable)
+        # clés = index : survivent aux noms de colonnes en double
+        for i, name in enumerate(result.columns):
+            # Text : un nom de colonne comme `[/]` ne doit pas être lu comme du markup
+            label = Text(name)
+            if self._sort and self._sort[0] == i:
+                label.append(" ▼" if self._sort[1] else " ▲")
+            table.add_column(label, key=str(i))
+
+    def on_data_table_header_selected(self, event: DataTable.HeaderSelected) -> None:
+        # clic sur un en-tête -> tri (bascule croissant/décroissant)
+        if event.data_table.id != "results" or self._result is None:
+            return
+        col = int(event.column_key.value)
+        self._sort = (col, self._sort == (col, False))
+        self._sort_results()
+
+    def _sort_results(self) -> None:
+        """Réordonne le tableau selon `_sort`, sur les valeurs affichées (modifications comprises).
+
+        Les clés de ligne (index dans `_result.rows`) ne changent pas : édition,
+        suppression et enregistrement retrouvent leurs lignes après le tri.
+        """
+        result = self._result
+        col, reverse = self._sort
+        table = self.query_one("#results", DataTable)
+        # cellules déjà rendues (styles NULL / DEFAULT / modifiée) réutilisées telles quelles
+        cells = {int(key.value): table.get_row(key) for key in table.rows}
+
+        def value(row: int):
+            if (row, col) in self._edits:
+                return self._edits[(row, col)]
+            if row in self._new_rows:
+                return None  # DEFAULT : rangée avec les NULL
+            return result.rows[row][col]
+
+        values = {row: value(row) for row in sorted(cells)}
+        order = sorted(
+            (row for row, v in values.items() if v is not None),
+            key=lambda row: _sort_key(values[row]), reverse=reverse,
+        )
+        # NULL en fin de tableau quel que soit le sens
+        order += [row for row, v in values.items() if v is None]
+        table.clear(columns=True)
+        self._add_columns(result)
+        for row in order:
+            table.add_row(*cells[row], key=str(row))
+        table.move_cursor(row=0, column=col)
 
     # --- édition des résultats ---------------------------------------------
     def _edit_cell(self, row: int, col: int) -> None:
@@ -922,7 +1093,7 @@ class QueryScreen(Screen):
             key=str(row),
         )
         first = next(i for i, source in enumerate(result.sources) if source)
-        table.move_cursor(row=row, column=first)
+        table.move_cursor(row=table.get_row_index(str(row)), column=first)
         table.focus()
         self._show_pending()
 
@@ -1091,7 +1262,8 @@ class QueryScreen(Screen):
             self._build_inserts(result, edits, new_rows) if new_rows else [],
         )
 
-    @work(thread=True, exclusive=True)
+    # pas exclusive : `_writing` empêche déjà deux écritures simultanées
+    @work(thread=True)
     def _save(
         self, result: QueryResult, edits: dict, new_rows: list[int],
         updates: list[RowUpdate], inserts: list[RowInsert],

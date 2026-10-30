@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from http.cookiejar import CookieJar
 
 import httpx
 
@@ -20,11 +21,33 @@ class HttpResult:
     headers: dict[str, str]
     body: str
     error: str | None = None
+    # redirections suivies avant la réponse finale : « 302 https://… »
+    redirects: list[str] = field(default_factory=list)
+
+
+class _NoCookieJar(CookieJar):
+    """Jar qui ne retient aucun cookie reçu.
+
+    Le client est partagé entre toutes les requêtes (et le fuzzing) : un
+    `Set-Cookie` mémorisé serait renvoyé en douce aux requêtes suivantes et
+    fausserait les tests (requête « non authentifiée », brute force…). Seul
+    l'en-tête `Cookie` écrit dans la requête est envoyé (y compris pendant
+    une chaîne de redirections : un cookie posé par un 302 n'est pas suivi).
+    """
+
+    def extract_cookies(self, response, request) -> None:
+        pass
+
+    def set_cookie(self, cookie) -> None:
+        pass
 
 
 def make_client(timeout: float = 30.0) -> httpx.AsyncClient:
     """Crée un client réutilisable (connexions persistantes / keep-alive)."""
-    return httpx.AsyncClient(timeout=timeout, follow_redirects=True)
+    return httpx.AsyncClient(
+        # le jar lui-même : un `httpx.Cookies` serait recopié dans un CookieJar standard
+        timeout=timeout, follow_redirects=True, cookies=_NoCookieJar()
+    )
 
 
 async def send_request(
@@ -62,12 +85,14 @@ async def send_request(
             size=len(response.content),
             headers=dict(response.headers),
             body=_pretty_body(response),
+            redirects=[f"{r.status_code} {r.url}" for r in response.history],
         )
     except Exception as exc:  # réseau, DNS, timeout, URL invalide...
         elapsed = (time.perf_counter() - start) * 1000
         return HttpResult(
             status=0, reason="ERREUR", elapsed_ms=elapsed, size=0,
-            headers={}, body="", error=str(exc),
+            # str(exc) est souvent vide (timeouts httpx) : le type reste lisible
+            headers={}, body="", error=f"{type(exc).__name__}: {exc}".rstrip(": "),
         )
 
 

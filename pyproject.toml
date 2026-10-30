@@ -4,8 +4,12 @@ version = "0.2.0"
 description = "Trois TUI (client HTTP, client SQL, gestion Docker) dans un seul projet"
 requires-python = ">=3.10"
 dependencies = [
-    "textual>=0.80",
+    # le code s'appuie sur des détails internes de Textual 8 (DataTable, Tree, sélection)
+    "textual>=8.2,<9",
     "httpx>=0.27",
+    # décodage par httpx des réponses compressées en brotli (br) et zstd
+    "brotli>=1.1",
+    "zstandard>=0.22",
     "psycopg[binary]>=3.1",
     "pymysql>=1.1",
     "cryptography>=42.0",

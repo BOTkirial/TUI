@@ -30,12 +30,24 @@ _PROVIDER_MAP = {
 }
 
 
-def _map_provider(provider: str) -> str | None:
-    provider = (provider or "").lower()
+def _map_provider(conn: dict) -> str | None:
+    """Notre pilote d'après `provider` (le moteur) ; `driver` distingue MariaDB.
+
+    DBeaver range MariaDB sous le provider `mysql` avec `"driver": "mariaDB"`.
+    """
+    provider = str(conn.get("provider") or "").lower()
     for key, driver in _PROVIDER_MAP.items():
         if key in provider:
+            if driver == "mysql" and "maria" in str(conn.get("driver") or "").lower():
+                return "mariadb"
             return driver
     return None
+
+
+def _section(data: dict, key: str) -> dict:
+    """Sous-objet `key` de `data`, {} s'il est absent, `null` ou d'un autre type."""
+    value = data.get(key)
+    return value if isinstance(value, dict) else {}
 
 
 def default_workspace_paths() -> list[Path]:
@@ -74,9 +86,11 @@ def _decrypt_credentials(path: Path) -> dict:
     # binaire brut (DBeaver actuel) ; base64 gardé en repli (anciens formats)
     for decode in (bytes, base64.b64decode):
         try:
-            return _decrypt_blob(decode(raw))
+            creds = _decrypt_blob(decode(raw))
         except Exception:
             continue
+        if isinstance(creds, dict):
+            return creds
     return {}
 
 
@@ -92,8 +106,8 @@ def _ssh_settings(cfg: dict, cred: dict) -> dict:
     `cred` = identifiants déchiffrés de l'entrée `network/ssh_tunnel`.
     Les serveurs de rebond (jumpServer) ne sont pas repris.
     """
-    handler = cfg.get("handlers", {}).get("ssh_tunnel") or {}
-    props = handler.get("properties", {})
+    handler = _section(_section(cfg, "handlers"), "ssh_tunnel")
+    props = _section(handler, "properties")
     if not props.get("host"):
         return {}
     try:
@@ -106,14 +120,17 @@ def _ssh_settings(cfg: dict, cred: dict) -> dict:
         ssh_enabled=bool(handler.get("enabled")),
         ssh_host=props["host"],
         ssh_port=port,
-        ssh_user=cred.get("user", props.get("user", "")),
-        ssh_password=cred.get("password", ""),
-        ssh_key=_portable_key_path(key),
+        ssh_user=cred.get("user") or props.get("user") or "",
+        ssh_password=cred.get("password") or "",
+        ssh_key=_portable_key_path(key or ""),
     )
 
 
 def import_connections(workspace: str | Path | None = None) -> list[Connection]:
-    """Importe les connexions depuis un workspace DBeaver."""
+    """Importe les connexions depuis un workspace DBeaver.
+
+    Noms en double dans DBeaver : suffixés « (2) », « (3) »… plutôt que confondus.
+    """
     roots = [Path(workspace)] if workspace else default_workspace_paths()
     for root in roots:
         sources = root / "data-sources.json"
@@ -125,31 +142,47 @@ def import_connections(workspace: str | Path | None = None) -> list[Connection]:
 
 def _parse_sources(sources_path: Path, creds: dict) -> list[Connection]:
     data = json.loads(sources_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"{sources_path.name} : objet JSON attendu")
     out: list[Connection] = []
+    names: set[str] = set()
 
-    for conn_id, conn in data.get("connections", {}).items():
-        cfg = conn.get("configuration", {})
-        driver = _map_provider(conn.get("provider", "") or cfg.get("type", ""))
+    for conn_id, conn in _section(data, "connections").items():
+        if not isinstance(conn, dict):
+            continue
+        driver = _map_provider(conn)
         if driver is None:
             continue  # on ne garde que pg / mysql / maria
 
-        conn_creds = creds.get(conn_id, {})
-        cred = conn_creds.get("#connection", {})
+        # sections parfois `null` dans data-sources.json : traitées comme absentes
+        cfg = _section(conn, "configuration")
+        conn_creds = _section(creds, conn_id)
+        cred = _section(conn_creds, "#connection")
         try:
-            port = int(cfg.get("port") or DEFAULT_PORTS[driver])
+            port = int(float(cfg.get("port") or DEFAULT_PORTS[driver]))
         except (TypeError, ValueError):
             port = DEFAULT_PORTS[driver]
 
         out.append(
             Connection(
-                name=conn.get("name", conn_id),
+                name=_unique_name(str(conn.get("name") or conn_id), names),
                 driver=driver,
-                host=cfg.get("host", "localhost"),
+                host=cfg.get("host") or "localhost",
                 port=port,
-                database=cfg.get("database", ""),
-                user=cred.get("user", cfg.get("user", "")),
-                password=cred.get("password", ""),
-                **_ssh_settings(cfg, conn_creds.get("network/ssh_tunnel", {})),
+                database=cfg.get("database") or "",
+                user=cred.get("user") or cfg.get("user") or "",
+                password=cred.get("password") or "",
+                **_ssh_settings(cfg, _section(conn_creds, "network/ssh_tunnel")),
             )
         )
     return out
+
+
+def _unique_name(name: str, taken: set[str]) -> str:
+    """`name`, ou `name (2)`, `name (3)`… s'il est déjà pris ; l'ajoute à `taken`."""
+    candidate, n = name, 1
+    while candidate in taken:
+        n += 1
+        candidate = f"{name} ({n})"
+    taken.add(candidate)
+    return candidate

@@ -7,6 +7,7 @@ session SSH, vers l'hôte/port de la base tels que vus depuis ce serveur.
 
 from __future__ import annotations
 
+import os
 import select
 import socket
 import socketserver
@@ -46,8 +47,11 @@ class _ForwardHandler(socketserver.BaseRequestHandler):
             chan = server.transport.open_channel(
                 "direct-tcpip", server.remote, self.request.getpeername()
             )
-        except Exception:
-            # refus du serveur SSH : le client SQL verra la connexion fermée
+        except Exception as exc:
+            # refus du serveur SSH (ex. « Connect failed » : base injoignable depuis
+            # le bastion) : le client SQL ne voit qu'une connexion fermée, l'erreur
+            # est gardée pour compléter son message
+            server.last_error = getattr(exc, "text", None) or str(exc) or type(exc).__name__
             return
         # source -> destination, pour chaque sens encore ouvert
         pending = {self.request: chan, chan: self.request}
@@ -78,6 +82,8 @@ class _ForwardServer(socketserver.ThreadingTCPServer):
         super().__init__(("127.0.0.1", 0), _ForwardHandler)
         self.transport = transport
         self.remote = remote
+        # dernier refus d'ouverture de canal (lu par Database après un échec)
+        self.last_error: str | None = None
 
 
 class SshTunnel:
@@ -94,7 +100,12 @@ class SshTunnel:
         client.load_system_host_keys()
         known = known_hosts_path()
         known.parent.mkdir(parents=True, exist_ok=True)
-        known.touch(exist_ok=True)
+        known.touch(mode=0o600, exist_ok=True)
+        try:
+            # à côté de connections.json : mêmes droits restreints
+            os.chmod(known, 0o600)
+        except OSError:
+            pass
         # hôte inconnu : accepté et mémorisé dans `known` à la 1re connexion ;
         # clé différente d'une clé connue → BadHostKeyException (refus)
         client.load_host_keys(str(known))
@@ -123,6 +134,16 @@ class SshTunnel:
             target=self._server.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True
         ).start()
         return self._server.server_address[:2]
+
+    @property
+    def last_error(self) -> str | None:
+        """Dernier refus du serveur SSH à l'ouverture d'un canal vers la base."""
+        return self._server.last_error if self._server is not None else None
+
+    @last_error.setter
+    def last_error(self, value: str | None) -> None:
+        if self._server is not None:
+            self._server.last_error = value
 
     def close(self) -> None:
         # session d'abord : ferme les canaux, donc les relais en cours

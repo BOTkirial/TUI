@@ -1,16 +1,27 @@
 """Abstraction fine au-dessus de psycopg (Postgres) et PyMySQL (MySQL/MariaDB).
 
 Tous les appels sont bloquants : l'app Textual les exécute dans un worker de
-type thread pour ne pas figer l'interface.
+type thread pour ne pas figer l'interface. Plusieurs workers peuvent viser la
+même connexion (requête, enregistrement, changement de base, fermeture) : les
+méthodes publiques sont sérialisées par un verrou, un pilote DB-API n'étant
+pas fait pour être utilisé par deux threads à la fois.
 """
 
 from __future__ import annotations
 
+import json
 import re
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
 from .connections import Connection
+
+# OID Postgres des types json et jsonb : leurs listes Python sont du JSON, les
+# autres listes sont des tableaux Postgres
+_PG_JSON_OIDS = {114, 3802}
+# json[] et jsonb[] : éléments JSON (une liste y est une valeur, pas une dimension)
+_PG_JSON_ARRAY_OIDS = {199, 3807}
 
 # table qualifiée : (schéma ou base, nom)
 TableRef = tuple[str, str]
@@ -40,6 +51,8 @@ class QueryResult:
     keys: dict[TableRef, list[int]] = field(default_factory=dict)
     # True si des lignes au-delà de `max_rows` ont été ignorées
     truncated: bool = False
+    # base courante au moment de l'exécution (les clés Postgres en dépendent)
+    database: str = ""
 
 
 @dataclass
@@ -68,39 +81,69 @@ class Database:
 
     def __init__(self, connection: Connection):
         self.meta = connection
+        # base courante : change avec `use_database` (la connexion enregistrée reste intacte)
+        self.database = connection.database
         self._conn = None
         self._tunnel = None
+        # hôte/port effectivement joints (extrémité locale du tunnel SSH le cas échéant)
+        self._endpoint: tuple[str, int] | None = None
+        # réentrant : list_tables/list_databases appellent execute
+        self._lock = threading.RLock()
 
     def connect(self) -> None:
         """Ouvre la connexion, via le tunnel SSH s'il est configuré."""
-        host, port = self.meta.host, self.meta.port
-        try:
-            if self.meta.uses_ssh:
-                from .tunnel import SshTunnel
+        with self._lock:
+            host, port = self.meta.host, self.meta.port
+            try:
+                if self.meta.uses_ssh:
+                    from .tunnel import SshTunnel
 
-                self._tunnel = SshTunnel(self.meta)
-                host, port = self._tunnel.start()
-            self._connect_db(host, port)
-        except Exception:
-            self.close()
+                    self._tunnel = SshTunnel(self.meta)
+                    host, port = self._tunnel.start()
+                self._endpoint = (host, port)
+                self._conn = self._connect_db(self.database)
+            except Exception:
+                self.close()
+                raise
+
+    def _connect_db(self, database: str):
+        """Nouvelle connexion du pilote vers `database` (vide = base par défaut).
+
+        Via un tunnel, un refus du serveur SSH n'apparaît côté pilote que comme
+        une connexion fermée : on y ajoute l'erreur relevée par le tunnel.
+        """
+        if self._tunnel is not None:
+            self._tunnel.last_error = None
+        try:
+            return self._open_driver(database)
+        except Exception as exc:
+            tunnel_error = self._tunnel.last_error if self._tunnel is not None else None
+            if tunnel_error:
+                raise ConnectionError(
+                    f"{exc} — tunnel SSH {self.meta.ssh_host} vers "
+                    f"{self.meta.host}:{self.meta.port} : {tunnel_error}"
+                ) from exc
             raise
 
-    def _connect_db(self, host: str, port: int) -> None:
+    def _open_driver(self, database: str):
+        host, port = self._endpoint
         if self.meta.driver == "postgres":
             import psycopg
 
-            self._conn = psycopg.connect(
+            return psycopg.connect(
                 host=host, port=port,
-                dbname=self.meta.database, user=self.meta.user,
+                # sans nom, libpq viserait une base du nom de l'utilisateur,
+                # souvent inexistante : `postgres` sert à lister les bases
+                dbname=database or "postgres", user=self.meta.user,
                 password=self.meta.password, connect_timeout=10,
             )
         elif self.meta.driver in ("mysql", "mariadb"):
             import pymysql
             from pymysql.constants import CLIENT
 
-            self._conn = pymysql.connect(
+            return pymysql.connect(
                 host=host, port=port,
-                database=self.meta.database or None, user=self.meta.user,
+                database=database or None, user=self.meta.user,
                 password=self.meta.password, connect_timeout=10,
                 # rowcount = lignes trouvées (comme Postgres), pas seulement changées :
                 # sinon un UPDATE sans changement effectif ressemble à une ligne disparue
@@ -110,76 +153,134 @@ class Database:
             raise ValueError(f"Pilote non supporté : {self.meta.driver}")
 
     def close(self) -> None:
-        try:
-            if self._conn is not None:
-                self._conn.close()
-        finally:
-            self._conn = None
-            if self._tunnel is not None:
-                self._tunnel.close()
-                self._tunnel = None
+        # verrou : attend la fin d'une requête en cours plutôt que de couper
+        # la connexion sous un autre thread
+        with self._lock:
+            try:
+                if self._conn is not None:
+                    self._conn.close()
+            finally:
+                self._conn = None
+                if self._tunnel is not None:
+                    self._tunnel.close()
+                    self._tunnel = None
 
     def execute(self, sql: str, max_rows: int | None = None) -> QueryResult:
         """Exécute une requête et renvoie le résultat normalisé.
 
-        `max_rows` : lignes lues au plus (le reste est ignoré, `truncated` = True).
+        `max_rows` : lignes conservées au plus (le reste est ignoré, `truncated` =
+        True). Les curseurs sont côté client : le pilote reçoit quand même tout le
+        résultat en mémoire, la limite épargne la conversion et l'affichage.
         """
-        if self._conn is None:
-            raise RuntimeError("Non connecté")
+        with self._lock:
+            # lue une seule fois : commit/rollback sur la connexion qui a exécuté
+            conn = self._conn
+            if conn is None:
+                raise RuntimeError("Non connecté")
 
-        with self._conn.cursor() as cur:
-            try:
-                cur.execute(sql)
-                rows = None
-                if cur.description:  # requête qui renvoie des lignes
-                    if max_rows is None:
-                        rows = cur.fetchall()
-                    else:
-                        rows = cur.fetchmany(max_rows + 1)
-                # validé dans tous les cas : un SELECT laissé en transaction garde
-                # ses verrous (Postgres) ou fige l'instantané lu (MySQL, REPEATABLE
-                # READ : changements des autres invisibles) ; un UPDATE … RETURNING
-                # renvoie des lignes et serait perdu à la fermeture
-                self._conn.commit()
-            except Exception:
-                # sans rollback, Postgres refuse toute requête suivante
-                # (« current transaction is aborted »)
-                self._conn.rollback()
-                raise
-            if rows is not None:
-                rows = list(rows)
-                truncated = max_rows is not None and len(rows) > max_rows
-                if truncated:
-                    rows = rows[:max_rows]
-                columns = [desc[0] for desc in cur.description]
-                result = QueryResult(
-                    columns=columns, rows=rows, rowcount=len(rows), truncated=truncated
+            with conn.cursor() as cur:
+                try:
+                    cur.execute(sql)
+                    rows = None
+                    if cur.description:  # requête qui renvoie des lignes
+                        if max_rows is None:
+                            rows = cur.fetchall()
+                        else:
+                            rows = cur.fetchmany(max_rows + 1)
+                    # validé dans tous les cas : un SELECT laissé en transaction garde
+                    # ses verrous (Postgres) ou fige l'instantané lu (MySQL, REPEATABLE
+                    # READ : changements des autres invisibles) ; un UPDATE … RETURNING
+                    # renvoie des lignes et serait perdu à la fermeture
+                    conn.commit()
+                except Exception:
+                    # sans rollback, Postgres refuse toute requête suivante
+                    # (« current transaction is aborted »)
+                    conn.rollback()
+                    raise
+                if rows is not None:
+                    rows = list(rows)
+                    truncated = max_rows is not None and len(rows) > max_rows
+                    if truncated:
+                        rows = rows[:max_rows]
+                    rows = self._normalize_rows(cur, rows)
+                    columns = [desc[0] for desc in cur.description]
+                    result = QueryResult(
+                        columns=columns, rows=rows, rowcount=len(rows),
+                        truncated=truncated, database=self.database,
+                    )
+                    self._detect_editable(conn, cur, result)
+                    return result
+                # requête de modification (INSERT/UPDATE/DELETE/DDL)
+                if cur.rowcount >= 0:
+                    message = f"{cur.rowcount} ligne(s) affectée(s)"
+                else:
+                    # DDL avec psycopg : rowcount = -1, statut du serveur (« CREATE TABLE »)
+                    message = getattr(cur, "statusmessage", None) or "OK"
+                return QueryResult(
+                    columns=[], rows=[], rowcount=cur.rowcount, message=message,
+                    database=self.database,
                 )
-                self._detect_editable(cur, result)
-                return result
-            # requête de modification (INSERT/UPDATE/DELETE/DDL)
-            return QueryResult(
-                columns=[], rows=[], rowcount=cur.rowcount,
-                message=f"{cur.rowcount} ligne(s) affectée(s)",
-            )
+
+    def _normalize_rows(self, cur, rows: list[tuple]) -> list[tuple]:
+        """Postgres : tableaux (listes Python hors colonnes json/jsonb) -> littéral `{…}`.
+
+        Affichés en JSON, ils seraient refusés à l'enregistrement (« malformed
+        array literal ») ; le littéral Postgres s'édite et se renvoie tel quel.
+        """
+        if self.meta.driver != "postgres":
+            return rows
+        # index de colonne -> éléments JSON ?
+        array_columns = {
+            i: desc.type_code in _PG_JSON_ARRAY_OIDS
+            for i, desc in enumerate(cur.description) if desc.type_code not in _PG_JSON_OIDS
+        }
+        converted = []
+        for row in rows:
+            if any(isinstance(row[i], list) for i in array_columns):
+                row = list(row)
+                for i, json_items in array_columns.items():
+                    if isinstance(row[i], list):
+                        row[i] = _pg_array_literal(row[i], json_items)
+                row = tuple(row)
+            converted.append(row)
+        return converted
 
     @property
-    def has_databases(self) -> bool:
-        """MySQL/MariaDB : plusieurs bases par connexion, choisies par `USE`.
+    def table_refs_include_database(self) -> bool:
+        """MySQL : `TableRef` = (base, table), valable quelle que soit la base courante.
 
-        (Postgres : une base par connexion ; sans nom, c'est celle de l'utilisateur.)
+        Postgres : (schéma, table), relatif à la base de la connexion.
         """
-        return self.meta.driver in ("mysql", "mariadb")
+        return self.meta.driver != "postgres"
 
     def list_databases(self) -> list[str]:
-        """Bases visibles par l'utilisateur (MySQL/MariaDB)."""
-        return [str(row[0]) for row in self.execute("SHOW DATABASES").rows]
+        """Bases visibles par l'utilisateur."""
+        if self.meta.driver == "postgres":
+            # seulement celles où il peut se connecter (le choix rouvre une connexion)
+            sql = (
+                "SELECT datname FROM pg_database "
+                "WHERE datallowconn AND NOT datistemplate "
+                "AND has_database_privilege(datname, 'CONNECT') ORDER BY 1"
+            )
+        else:
+            sql = "SHOW DATABASES"
+        return [str(row[0]) for row in self.execute(sql).rows]
 
     def use_database(self, name: str) -> None:
-        """Change la base courante (MySQL/MariaDB), équivalent de `USE`."""
-        if self._conn is None:
-            raise RuntimeError("Non connecté")
-        self._conn.select_db(name)
+        """Change la base courante.
+
+        MySQL/MariaDB : équivalent de `USE`. Postgres : une connexion ne voit
+        qu'une base, on en ouvre une nouvelle (même tunnel) avant de fermer l'ancienne.
+        """
+        with self._lock:
+            if self._conn is None:
+                raise RuntimeError("Non connecté")
+            if self.meta.driver == "postgres":
+                old, self._conn = self._conn, self._connect_db(name)
+                old.close()
+            else:
+                self._conn.select_db(name)
+            self.database = name
 
     def list_tables(self) -> list[str]:
         """Liste les tables de la base courante."""
@@ -212,46 +313,51 @@ class Database:
         Renvoie, par insertion, les colonnes `returning` relues (None si la
         ligne insérée n'a pas pu être retrouvée).
         """
-        if self._conn is None:
-            raise RuntimeError("Non connecté")
+        with self._lock:
+            conn = self._conn
+            if conn is None:
+                raise RuntimeError("Non connecté")
 
-        with self._conn.cursor() as cur:
-            try:
-                for update in updates:
-                    cur.execute(*self._update_sql(update))
-                    # 0 ligne = supprimée/modifiée entre-temps ; on refuse d'écrire à l'aveugle
-                    if cur.rowcount != 1:
-                        raise RuntimeError(
-                            f"{update.table[0]}.{update.table[1]} {update.key} : "
-                            f"{cur.rowcount} ligne(s) touchée(s) au lieu d'une"
-                        )
-                inserted = [self._insert(cur, insert) for insert in inserts]
-            except Exception:
-                self._conn.rollback()
-                raise
-            self._conn.commit()
-        return inserted
+            with conn.cursor() as cur:
+                try:
+                    for update in updates:
+                        cur.execute(*self._update_sql(update))
+                        # 0 ligne = supprimée/modifiée entre-temps ; on refuse d'écrire à l'aveugle
+                        if cur.rowcount != 1:
+                            raise RuntimeError(
+                                f"{update.table[0]}.{update.table[1]} {update.key} : "
+                                f"{cur.rowcount} ligne(s) touchée(s) au lieu d'une"
+                            )
+                    inserted = [self._insert(cur, insert) for insert in inserts]
+                except Exception:
+                    conn.rollback()
+                    raise
+                conn.commit()
+            return inserted
 
     def delete_row(self, table: TableRef, key: dict[str, Any]) -> None:
         """Supprime la ligne de clé primaire `key` ; refusé si elle n'en touche pas une seule."""
-        if self._conn is None:
-            raise RuntimeError("Non connecté")
-
         condition = " AND ".join(f"{self._quote(col)} = %s" for col in key)
-        with self._conn.cursor() as cur:
-            try:
-                cur.execute(
-                    f"DELETE FROM {self._table_name(table)} WHERE {condition}", list(key.values())
-                )
-                if cur.rowcount != 1:
-                    raise RuntimeError(
-                        f"{table[0]}.{table[1]} {key} : "
-                        f"{cur.rowcount} ligne(s) touchée(s) au lieu d'une"
+        with self._lock:
+            conn = self._conn
+            if conn is None:
+                raise RuntimeError("Non connecté")
+
+            with conn.cursor() as cur:
+                try:
+                    cur.execute(
+                        f"DELETE FROM {self._table_name(table)} WHERE {condition}",
+                        list(key.values()),
                     )
-            except Exception:
-                self._conn.rollback()
-                raise
-            self._conn.commit()
+                    if cur.rowcount != 1:
+                        raise RuntimeError(
+                            f"{table[0]}.{table[1]} {key} : "
+                            f"{cur.rowcount} ligne(s) touchée(s) au lieu d'une"
+                        )
+                except Exception:
+                    conn.rollback()
+                    raise
+                conn.commit()
 
     def _table_name(self, table: TableRef) -> str:
         return f"{self._quote(table[0])}.{self._quote(table[1])}"
@@ -297,7 +403,7 @@ class Database:
         rows = cur.fetchall()
         return rows[0] if len(rows) == 1 else None
 
-    def _detect_editable(self, cur, result: QueryResult) -> None:
+    def _detect_editable(self, conn, cur, result: QueryResult) -> None:
         """Renseigne `sources`/`keys` : quelles colonnes du résultat sont modifiables.
 
         Une colonne l'est si elle provient directement d'une table dont toute la
@@ -307,16 +413,28 @@ class Database:
         result.sources = [None] * len(result.columns)
         try:
             if self.meta.driver == "postgres":
-                origins, primary_keys = self._origins_postgres(cur)
+                origins, primary_keys = self._origins_postgres(conn, cur)
             else:
-                origins, primary_keys = self._origins_mysql(cur)
+                origins, primary_keys = self._origins_mysql(conn, cur)
         except Exception:
             return
         finally:
             # lectures de métadonnées seules : on referme la transaction ouverte
-            self._conn.rollback()
+            conn.rollback()
+
+        # même colonne présente deux fois (auto-jointure `emp e JOIN emp m`) :
+        # impossible de savoir quelle ligne viser, la table reste en lecture seule
+        seen: set[tuple[TableRef, str]] = set()
+        ambiguous: set[TableRef] = set()
+        for origin in origins:
+            if origin is not None:
+                if origin in seen:
+                    ambiguous.add(origin[0])
+                seen.add(origin)
 
         for table, pk_columns in primary_keys.items():
+            if table in ambiguous:
+                continue
             key_indexes = [
                 next((i for i, o in enumerate(origins) if o == (table, col)), None)
                 for col in pk_columns
@@ -327,7 +445,7 @@ class Database:
             if origin is not None and origin[0] in result.keys:
                 result.sources[i] = ColumnSource(*origin)
 
-    def _origins_postgres(self, cur):
+    def _origins_postgres(self, conn, cur):
         """Origine de chaque colonne via les métadonnées du protocole Postgres."""
         res = cur.pgresult
         # (oid de la table, n° de colonne), 0 pour une expression calculée
@@ -336,7 +454,7 @@ class Database:
         if not oids:
             return [None] * len(raw), {}
 
-        with self._conn.cursor() as meta:
+        with conn.cursor() as meta:
             meta.execute(
                 "SELECT c.oid::int8, n.nspname, c.relname, a.attnum, a.attname, "
                 "       COALESCE(a.attnum = ANY(i.indkey), false) "
@@ -355,7 +473,7 @@ class Database:
                     primary_keys.setdefault((schema, table), []).append(attname)
         return [columns.get(item) for item in raw], primary_keys
 
-    def _origins_mysql(self, cur):
+    def _origins_mysql(self, conn, cur):
         """Origine de chaque colonne via les descripteurs de champ MySQL."""
         origins: list[tuple[TableRef, str] | None] = []
         # attribut privé de PyMySQL : seul accès à org_table / org_name (alias résolus)
@@ -364,7 +482,7 @@ class Database:
             origins.append(((db, f.org_table), f.org_name) if db and f.org_table else None)
 
         primary_keys: dict[TableRef, list[str]] = {}
-        with self._conn.cursor() as meta:
+        with conn.cursor() as meta:
             for table in {o[0] for o in origins if o}:
                 meta.execute(
                     "SELECT COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE "
@@ -374,3 +492,27 @@ class Database:
                 )
                 primary_keys[table] = [row[0] for row in meta.fetchall()]
         return origins, primary_keys
+
+
+def _pg_array_literal(values: list, json_items: bool = False) -> str:
+    """Liste Python (éventuellement imbriquée) -> littéral de tableau Postgres `{…}`."""
+    return "{" + ",".join(_pg_array_item(v, json_items) for v in values) + "}"
+
+
+def _pg_array_item(value, json_items: bool) -> str:
+    if value is None:
+        return "NULL"
+    if json_items:  # json[] / jsonb[]
+        text = json.dumps(value, ensure_ascii=False)
+    elif isinstance(value, list):  # tableau multidimensionnel
+        return _pg_array_literal(value)
+    elif isinstance(value, bool):
+        return "t" if value else "f"
+    elif isinstance(value, (bytes, bytearray, memoryview)):
+        text = "\\x" + bytes(value).hex()
+    else:
+        text = str(value)
+    # guillemets seulement si nécessaire : vide, NULL, séparateurs, espaces
+    if text and text.upper() != "NULL" and not re.search(r'[{}",\\\s]', text):
+        return text
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'

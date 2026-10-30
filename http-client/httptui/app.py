@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -19,6 +21,7 @@ from textual.widgets import (
     Footer,
     Input,
     Label,
+    OptionList,
     Select,
     TabbedContent,
     TabPane,
@@ -39,17 +42,32 @@ from tui_common import (
 from .client import HttpResult, make_client, send_request
 from .fuzzer import Fuzzer
 from .curlimport import parse_curl, request_name
+from .envfile import (
+    ENV_PREFIX,
+    EnvFile,
+    env_path,
+    list_folder_envs,
+    load_envs_dir,
+    read_env,
+    serialize_env,
+    substitute,
+    used_variables,
+    valid_env_name,
+    write_env_text,
+)
 from .httpfile import (
     METHODS,
     HttpRequest,
     delete_request,
     format_headers,
+    invalid_header_lines,
     list_request_folders,
     load_requests_dir,
     parse_headers,
     save_request,
     split_request_path,
 )
+from .postman import parse_postman, to_postman
 
 # colonnes du tableau de fuzzing : (clé de tri, libellé affiché)
 FUZZ_COLUMNS = [
@@ -87,11 +105,16 @@ class FuzzRow:
     def __post_init__(self) -> None:
         self.body_lower = self.result.body.lower()
 
-    def cells(self) -> tuple[str, ...]:
-        """Cellules affichées, dans l'ordre de `FUZZ_COLUMNS`."""
+    def cells(self) -> tuple[Text, ...]:
+        """Cellules affichées, dans l'ordre de `FUZZ_COLUMNS`.
+
+        En `Text` : DataTable lirait une `str` comme du markup, et les valeurs
+        de fuzz (`[/]`, `user[$ne]`…) feraient planter l'app.
+        """
         r = self.result
         status = r.reason if r.error else str(r.status)
-        return (str(self.idx), self.label, status, f"{r.elapsed_ms:.0f}", str(r.size))
+        cells = (str(self.idx), self.label, status, f"{r.elapsed_ms:.0f}", str(r.size))
+        return tuple(Text(c) for c in cells)
 
 
 def _request_path(req: HttpRequest) -> str:
@@ -99,16 +122,40 @@ def _request_path(req: HttpRequest) -> str:
     return f"{req.folder}/{req.name}" if req.folder else req.name
 
 
+def _env_display(env: EnvFile) -> str:
+    """Chemin affiché `dossier/.env.nom` d'un environnement."""
+    name = f"{ENV_PREFIX}{env.name}"
+    return f"{env.folder}/{name}" if env.folder else name
+
+
+def _leaf_path(item: HttpRequest | EnvFile) -> str:
+    return _env_display(item) if isinstance(item, EnvFile) else _request_path(item)
+
+
+def _leaf_key(item) -> tuple[bool, str, str] | None:
+    """Identifie une feuille de l'arbre entre deux relectures du disque."""
+    if isinstance(item, (HttpRequest, EnvFile)):
+        return isinstance(item, EnvFile), item.folder, item.name
+    return None
+
+
 def _request_label(req: HttpRequest) -> Text:
     # Text plutôt que str : un nom contenant `[` ne doit pas être lu comme du markup
     return Text(f"{req.method}  {req.name}")
 
 
+def _env_label(env: EnvFile) -> Text:
+    return Text.assemble(("ENV", "italic"), f"  {ENV_PREFIX}{env.name}")
+
+
 class PathPrompt(ModalScreen[tuple[str, str] | None]):
     """Petite fenêtre pour saisir une valeur (chemin, nom…).
 
-    Résultat : (id du bouton « ok » ou « alt », saisie), ou None si annulé.
+    Résultat : (id du bouton : « ok » ou celui d'un bouton secondaire, saisie),
+    ou None si annulé.
     """
+
+    BINDINGS = [Binding("escape", "cancel", "Annuler")]
 
     def __init__(
         self,
@@ -116,24 +163,25 @@ class PathPrompt(ModalScreen[tuple[str, str] | None]):
         placeholder: str = "",
         ok_label: str = "OK",
         value: str = "",
-        alt_label: str = "",
+        extra_buttons: list[tuple[str, str]] = (),
     ):
         super().__init__()
         self._label = label
         self._placeholder = placeholder
         self._ok_label = ok_label
         self._value = value
-        # bouton secondaire optionnel : renvoie ("alt", saisie), même vide
-        self._alt_label = alt_label
+        # boutons secondaires (id, libellé) : renvoient (id, saisie), même vide
+        self._extra_buttons = list(extra_buttons)
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
-            yield Label(self._label, classes="section")
+            # Text : le libellé contient des noms de fichiers (un `[` serait du markup)
+            yield Label(Text(self._label), classes="section")
             yield Input(self._value, placeholder=self._placeholder, id="path")
             with Horizontal(id="dialog-buttons"):
                 yield Button(self._ok_label, variant="primary", id="ok")
-                if self._alt_label:
-                    yield Button(self._alt_label, id="alt")
+                for button_id, label in self._extra_buttons:
+                    yield Button(label, id=button_id)
                 yield Button("Annuler", id="cancel")
 
     def on_mount(self) -> None:
@@ -141,8 +189,9 @@ class PathPrompt(ModalScreen[tuple[str, str] | None]):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         value = self.query_one("#path", Input).value
-        if event.button.id == "alt":
-            self.dismiss(("alt", value))
+        extra = {button_id for button_id, _ in self._extra_buttons}
+        if event.button.id in extra:
+            self.dismiss((event.button.id, value))
         elif event.button.id == "ok" and value:
             self.dismiss(("ok", value))
         else:
@@ -151,9 +200,13 @@ class PathPrompt(ModalScreen[tuple[str, str] | None]):
     def on_input_submitted(self, event: Input.Submitted) -> None:
         self.dismiss(("ok", event.value) if event.value else None)
 
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
 
 class RequestTree(Tree):
-    """Arbre des requêtes : un clic sur une requête la sélectionne sans l'ouvrir.
+    """Arbre des requêtes et environnements : un clic sur une feuille la
+    sélectionne sans l'ouvrir.
 
     L'ouverture passe par Entrée (`select_cursor` → `NodeSelected`) ;
     un clic sur un dossier le plie/déplie toujours.
@@ -162,7 +215,7 @@ class RequestTree(Tree):
     async def _on_click(self, event: events.Click) -> None:
         line = event.style.meta.get("line")
         node = self.get_node_at_line(line) if line is not None else None
-        if node is not None and isinstance(node.data, HttpRequest):
+        if node is not None and isinstance(node.data, (HttpRequest, EnvFile)):
             self.cursor_line = line
             # empêche Tree._on_click (appelé ensuite via la MRO) d'émettre NodeSelected
             event.prevent_default()
@@ -211,12 +264,175 @@ class CurlPrompt(ModalScreen[tuple[str, str] | None]):
         self.dismiss(None)
 
 
+class PostmanPrompt(ModalScreen[tuple[str, str] | None]):
+    """Chemin d'un export Postman (collection ou environnement) + dossier cible."""
+
+    BINDINGS = [Binding("escape", "cancel", "Annuler")]
+
+    def __init__(self, target: str = ""):
+        super().__init__()
+        self._target = target
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog", classes="wide"):
+            yield Label(
+                Text(f"Fichier JSON exporté de Postman (collection v2.x ou environnement, relatif à {self.app.root})"),
+                classes="section",
+            )
+            yield Input(placeholder="ma-collection.postman_collection.json", id="source")
+            yield Label("Importer dans le dossier (vide = racine)", classes="section")
+            yield Input(self._target, placeholder="dossier/", id="target")
+            with Horizontal(id="dialog-buttons"):
+                yield Button("Importer", variant="primary", id="ok")
+                yield Button("Annuler", id="cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#source", Input).focus()
+
+    def _submit(self) -> None:
+        source = self.query_one("#source", Input).value.strip()
+        target = self.query_one("#target", Input).value
+        self.dismiss((source, target) if source else None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "ok":
+            self._submit()
+        else:
+            self.dismiss(None)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self._submit()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+# choix « sans environnement » de EnvPrompt (un nom d'env ne peut pas être vide)
+_NO_ENV = ""
+
+
+class EnvPrompt(ModalScreen[str | None]):
+    """Choix de l'environnement d'envoi. Résultat : nom, `_NO_ENV`, ou None si annulé."""
+
+    BINDINGS = [Binding("escape", "cancel", "Annuler")]
+
+    def __init__(self, folder: str, envs: list[str], default: str | None):
+        super().__init__()
+        self._folder = folder
+        self._choices = [*envs, _NO_ENV]
+        self._default = default
+
+    def compose(self) -> ComposeResult:
+        where = f"« {self._folder}/ »" if self._folder else "la racine"
+        with Vertical(id="dialog"):
+            yield Label(Text(f"Environnement d'envoi ({where})"), classes="section")
+            yield OptionList(
+                *(Text(f"{ENV_PREFIX}{e}") for e in self._choices[:-1]),
+                Text("(aucun environnement)", style="italic"),
+                id="env-choice", classes="framed",
+            )
+            with Horizontal(id="dialog-buttons"):
+                yield Button("Envoyer", variant="primary", id="ok")
+                yield Button("Annuler", id="cancel")
+
+    def on_mount(self) -> None:
+        options = self.query_one("#env-choice", OptionList)
+        # pré-sélection : dernier environnement utilisé dans ce dossier
+        if self._default in self._choices:
+            options.highlighted = self._choices.index(self._default)
+        else:
+            options.highlighted = 0
+        options.focus()
+
+    def _submit(self) -> None:
+        index = self.query_one("#env-choice", OptionList).highlighted
+        self.dismiss(self._choices[index] if index is not None else None)
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        self._submit()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "ok":
+            self._submit()
+        else:
+            self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class EnvScreen(Screen[EnvFile]):
+    """Édition brute d'un fichier `.env.*` (format `NOM=valeur`)."""
+
+    BINDINGS = [
+        Binding("ctrl+s", "save", "Enregistrer"),
+        Binding("escape", "back", "Requêtes"),
+    ]
+
+    def __init__(self, env: EnvFile):
+        super().__init__()
+        self._env = env
+        self._saved = ""
+        self._discard_warned = False
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="editor"):
+            yield Label(Text(_env_display(self._env)), classes="title")
+            yield Label(
+                "Une variable par ligne : NOM=valeur (# = commentaire) — "
+                "remplace {{NOM}} dans les requêtes de ce dossier",
+                classes="hint",
+            )
+            yield TextArea(id="env-text", classes="editor-area framed")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        try:
+            self._saved = env_path(self.app.requests_dir, self._env).read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except OSError as exc:
+            self.notify(f"Lecture impossible : {exc}", severity="error")
+        area = self.query_one("#env-text", TextArea)
+        area.text = self._saved
+        area.focus()
+
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        self._discard_warned = False
+
+    def action_save(self) -> None:
+        text = self.query_one("#env-text", TextArea).text
+        path = env_path(self.app.requests_dir, self._env)
+        try:
+            path.write_text(text, encoding="utf-8")
+        except OSError as exc:
+            self.notify(f"Enregistrement impossible : {exc}", severity="error")
+            return
+        self._saved = text
+        self.notify(f"Enregistré dans {path}")
+
+    def action_back(self) -> None:
+        text = self.query_one("#env-text", TextArea).text
+        if text != self._saved and not self._discard_warned:
+            self._discard_warned = True
+            self.notify(
+                "Modifications non enregistrées : ctrl+s pour enregistrer, Échap à nouveau pour les abandonner",
+                severity="warning",
+            )
+            return
+        self.dismiss(self._env)
+
+
 class RequestListScreen(Screen):
     """Écran d'accueil plein écran : choix (ou création) de la requête à ouvrir."""
 
     BINDINGS = [
         Binding("ctrl+n", "new", "Nouvelle"),
-        Binding("ctrl+o", "import_curl", "Import curl"),
+        # aussi proposés par la fenêtre « Nouvelle » : masqués du pied de page
+        Binding("ctrl+o", "import_curl", "Import curl", show=False),
+        Binding("ctrl+t", "import_postman", "Import Postman", show=False),
+        # priority : sinon ctrl+e (fin de ligne) est pris par le champ filtre
+        Binding("ctrl+e", "export_postman", "Export Postman", priority=True),
         Binding("f5", "reload", "Actualiser"),
         Binding("delete", "delete", "Supprimer"),
         Binding("escape", "clear_filter", "Effacer filtre"),
@@ -235,7 +451,7 @@ class RequestListScreen(Screen):
         with Vertical(id="list-page"):
             yield Label("HTTP TUI — Requêtes", classes="title")
             yield Label(
-                "Tape pour filtrer · ↑↓ pour choisir · Entrée pour ouvrir · Suppr pour supprimer",
+                "Tape pour filtrer · ↑↓ pour choisir · Entrée pour ouvrir (requête ou .env.*) · Suppr pour supprimer",
                 classes="hint",
             )
             # select_on_focus=False : sinon la lettre redirigée depuis l'arbre
@@ -248,7 +464,6 @@ class RequestListScreen(Screen):
             with Horizontal(classes="button-row"):
                 yield Button("Nouvelle", id="new", variant="success")
                 yield Button("Ouvrir", id="open", variant="primary")
-                yield Button("Import curl", id="curl")
                 yield Button("Actualiser", id="reload")
                 yield Button("Supprimer", id="delete", variant="error")
         yield Footer()
@@ -259,29 +474,42 @@ class RequestListScreen(Screen):
 
     def _load_requests(
         self,
-        select: tuple[str, str] | None = None,
+        select: tuple[bool, str, str] | None = None,
         expanded: set[str] = frozenset(),
     ) -> None:
         """(Re)lit le disque et reconstruit l'arbre.
 
-        `select` = (dossier, nom) de la requête sous le curseur (sinon la 1re) ;
+        `select` = `_leaf_key` de la feuille sous le curseur (sinon la 1re requête) ;
         `expanded` = dossiers à garder dépliés.
         """
         self.app.requests = load_requests_dir(self.app.requests_dir)
+        self.app.envs = load_envs_dir(self.app.requests_dir)
+        target = next(
+            (i for i in [*self.app.envs, *self.app.requests] if _leaf_key(i) == select),
+            None,
+        )
+        self._show(target, expanded)
+
+    def _show(self, select: HttpRequest | EnvFile | None, expanded: set[str]) -> None:
+        """Reconstruit l'arbre depuis la mémoire (dossiers relus sur disque).
+
+        Contrairement à `_load_requests`, garde les requêtes créées mais pas
+        encore enregistrées.
+        """
         self._folders = list_request_folders(self.app.requests_dir)
         self._expanded = set(expanded)
         self._build_tree()
-        target = next(
-            (r for r in self.app.requests if (r.folder, r.name) == select), None
-        )
-        self._focus_request(target)
+        self._focus_leaf(select)
 
     # --- arbre des requêtes ---------------------------------------------
     def _filter_terms(self) -> list[str]:
         return self.query_one("#request-filter", Input).value.lower().split()
 
     def _build_tree(self) -> None:
-        """(Re)construit l'arbre depuis `app.requests`, restreint par le filtre."""
+        """(Re)construit l'arbre depuis `app.envs` + `app.requests`, restreint par le filtre.
+
+        Dans chaque dossier : sous-dossiers, puis environnements, puis requêtes.
+        """
         tree = self.query_one("#requests", Tree)
         tree.clear()
         tree.show_root = False
@@ -291,13 +519,16 @@ class RequestListScreen(Screen):
         if terms:
             # seuls les dossiers menant à un résultat, tous dépliés ;
             # créés avant les requêtes pour garder l'ordre dossiers d'abord
-            found = [r for r in self.app.requests if matches(_request_path(r), terms)]
-            needed = {r.folder for r in found}
+            found = [
+                i for i in [*self.app.envs, *self.app.requests]
+                if matches(_leaf_path(i), terms)
+            ]
+            needed = {i.folder for i in found}
             for folder in self._folders:
                 if folder in needed:
                     self._folder_node(folder)
-            for req in found:
-                self._add_request_node(req)
+            for item in found:
+                self._add_leaf_node(item)
             for node in self._folder_nodes.values():
                 node.expand()
             return
@@ -308,8 +539,8 @@ class RequestListScreen(Screen):
         for folder in self._expanded:
             if folder in self._folder_nodes:
                 self._folder_nodes[folder].expand()
-        for req in self.app.requests:
-            self._add_request_node(req)
+        for item in [*self.app.envs, *self.app.requests]:
+            self._add_leaf_node(item)
 
     def _expanded_folders(self) -> set[str]:
         """Dossiers dépliés hors filtre (pendant un filtre : l'état d'avant)."""
@@ -327,8 +558,8 @@ class RequestListScreen(Screen):
         under_cursor = node.data if node is not None else None
         self._build_tree()
         # filtre : 1er résultat ; filtre vidé : on reste sur la requête choisie
-        keep = under_cursor if not filtering and isinstance(under_cursor, HttpRequest) else None
-        self._focus_request(keep)
+        keep = under_cursor if not filtering and _leaf_key(under_cursor) else None
+        self._focus_leaf(keep)
 
     def _iter_nodes(self):
         """Nœuds de l'arbre, dans l'ordre d'affichage."""
@@ -338,9 +569,9 @@ class RequestListScreen(Screen):
             yield node
             pending.extend(reversed(node.children))
 
-    def _node_for(self, req: HttpRequest) -> TreeNode | None:
-        """Nœud affichant `req` (par identité), None s'il est masqué par le filtre."""
-        return next((n for n in self._iter_nodes() if n.data is req), None)
+    def _node_for(self, item: HttpRequest | EnvFile) -> TreeNode | None:
+        """Nœud affichant `item` (par identité), None s'il est masqué par le filtre."""
+        return next((n for n in self._iter_nodes() if n.data is item), None)
 
     def _folder_node(self, folder: str) -> TreeNode:
         """Nœud du dossier `folder`, créé (avec ses parents) au besoin."""
@@ -353,16 +584,22 @@ class RequestListScreen(Screen):
             self._folder_nodes[folder] = node
         return node
 
-    def _add_request_node(self, req: HttpRequest) -> TreeNode:
-        return self._folder_node(req.folder).add_leaf(_request_label(req), data=req)
+    def _add_leaf_node(self, item: HttpRequest | EnvFile) -> TreeNode:
+        label = _env_label(item) if isinstance(item, EnvFile) else _request_label(item)
+        return self._folder_node(item.folder).add_leaf(label, data=item)
 
-    def _focus_request(self, req: HttpRequest | None) -> None:
-        """Curseur sur `req` si elle est affichée, sinon sur la 1re requête visible."""
-        node = self._node_for(req) if req is not None else None
+    def _focus_leaf(self, item: HttpRequest | EnvFile | None) -> None:
+        """Curseur sur `item` s'il est affiché, sinon sur la 1re feuille visible.
+
+        Recherche par identité puis par `_leaf_key` : après une relecture du
+        disque, l'objet est une nouvelle instance.
+        """
+        node = self._node_for(item) if item is not None else None
+        if node is None and item is not None:
+            key = _leaf_key(item)
+            node = next((n for n in self._iter_nodes() if _leaf_key(n.data) == key), None)
         if node is None:
-            node = next(
-                (n for n in self._iter_nodes() if isinstance(n.data, HttpRequest)), None
-            )
+            node = next((n for n in self._iter_nodes() if _leaf_key(n.data)), None)
         if node is None:
             return
         parent = node.parent
@@ -383,7 +620,7 @@ class RequestListScreen(Screen):
         node = self._cursor_node()
         if node is None:
             return ""
-        if isinstance(node.data, HttpRequest):
+        if isinstance(node.data, (HttpRequest, EnvFile)):
             return node.data.folder
         return node.data or ""
 
@@ -395,20 +632,29 @@ class RequestListScreen(Screen):
         """Retour de l'éditeur : `req` = dernière version (sauvée ou non) de la requête."""
         # reconstruit : le libellé (méthode) a pu changer à la sauvegarde
         self._build_tree()
-        self._focus_request(req)
+        self._focus_leaf(req)
         self.query_one("#request-filter", Input).focus()
 
     def _add_and_open(self, req: HttpRequest) -> None:
         """Nouvelle requête : en mémoire (même hors filtre), puis ouverte."""
         self.app.requests.append(req)
-        self._add_request_node(req)
+        self._add_leaf_node(req)
         self._open_request(req)
+
+    def _open_env(self, env: EnvFile) -> None:
+        self.app.push_screen(EnvScreen(env), self._env_closed)
+
+    def _env_closed(self, env: EnvFile | None) -> None:
+        self._focus_leaf(env)
+        self.query_one("#request-filter", Input).focus()
 
     # --- évènements ------------------------------------------------------
     def on_tree_node_selected(self, event: Tree.NodeSelected) -> None:
-        # un dossier se déplie tout seul ; seule une requête ouvre l'éditeur
+        # un dossier se déplie tout seul ; requête / environnement : éditeur
         if isinstance(event.node.data, HttpRequest):
             self._open_request(event.node.data)
+        elif isinstance(event.node.data, EnvFile):
+            self._open_env(event.node.data)
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "request-filter":
@@ -450,7 +696,6 @@ class RequestListScreen(Screen):
         handlers = {
             "new": self.action_new,
             "open": self.query_one("#requests", Tree).action_select_cursor,
-            "curl": self.action_import_curl,
             "reload": self.action_reload,
             "delete": self.action_delete,
         }
@@ -486,7 +731,8 @@ class RequestListScreen(Screen):
 
     def _unique_name(self, raw: str, folder: str = "") -> str:
         """Rend un nom de fichier valide et unique dans `folder` (import curl surtout)."""
-        base = raw.strip().replace("/", "_").replace("\\", "_") or "requête"
+        # pas de `.` en tête : fichier caché, ou pris pour un environnement `.env.*`
+        base = raw.strip().replace("/", "_").replace("\\", "_").lstrip(".") or "requête"
         name, n = base, 2
         existing = {r.name for r in self.app.requests if r.folder == folder}
         while name in existing:
@@ -499,10 +745,19 @@ class RequestListScreen(Screen):
             if result is None:
                 return
             button, raw = result
-            # « Import curl » : ouvert ici (et non depuis la fenêtre, déjà fermée,
-            # qui emporterait le callback de résultat de CurlPrompt avec elle)
-            if button == "alt":
+            # imports ouverts ici (et non depuis la fenêtre, déjà fermée, qui
+            # emporterait le callback de résultat de la suivante avec elle)
+            if button == "curl":
                 self.action_import_curl(raw)
+                return
+            if button == "postman":
+                # seul le dossier sert de cible (le nom vient de la collection)
+                folder = raw.strip().rpartition("/")[0]
+                self.action_import_postman(f"{folder}/" if folder else "")
+                return
+            folder, _, leaf = raw.strip().rpartition("/")
+            if leaf.startswith(ENV_PREFIX):
+                self._create_env(folder, leaf[len(ENV_PREFIX):])
                 return
             parsed = self._parse_request_path(raw)
             if parsed is None:
@@ -515,10 +770,10 @@ class RequestListScreen(Screen):
         folder = self._selected_folder()
         self.app.push_screen(
             PathPrompt(
-                "Nom de la nouvelle requête (dossier/nom)",
+                "Nom de la nouvelle requête (dossier/nom) ou environnement (dossier/.env.nom)",
                 placeholder="dossier/ma-requête", ok_label="Créer",
                 value=f"{folder}/" if folder else "",
-                alt_label="Import curl",
+                extra_buttons=[("curl", "Import curl"), ("postman", "Import Postman")],
             ),
             done,
         )
@@ -562,38 +817,198 @@ class RequestListScreen(Screen):
             target = f"{folder}/" if folder else ""
         self.app.push_screen(CurlPrompt(target), done)
 
-    def action_delete(self) -> None:
-        """Supprime (après confirmation) la requête sous le curseur, fichier compris."""
-        node = self._cursor_node()
-        req = node.data if node is not None else None
-        if not isinstance(req, HttpRequest):
-            self.notify("Sélectionne une requête à supprimer", severity="warning")
+    def _create_env(self, folder: str, name: str) -> None:
+        """Crée le fichier `.env.<name>` (vide) dans `folder`, puis l'ouvre."""
+        # dossier normalisé : `/etc` ou ` api ` ne doivent pas sortir du répertoire
+        parts = self._valid_parts(folder) if folder.strip("/") else []
+        if parts is None:
             return
+        folder = "/".join(parts)
+        if not valid_env_name(name):
+            self.notify("Nom d'environnement invalide", severity="error")
+            return
+        env = EnvFile(name, folder)
+        path = env_path(self.app.requests_dir, env)
+        if path.exists():
+            self.notify(f"« {_env_display(env)} » existe déjà", severity="error")
+            return
+        try:
+            write_env_text(path, "")
+        except OSError as exc:
+            self.notify(f"Création impossible : {exc}", severity="error")
+            return
+        self.app.envs.append(env)
+        self._show(env, self._expanded_folders())
+        self._open_env(env)
+
+    def _write_env(self, env: EnvFile, variables: dict[str, str]) -> bool:
+        """Écrit un environnement importé ; un fichier existant n'est pas écrasé."""
+        path = env_path(self.app.requests_dir, env)
+        if path.exists():
+            self.notify(f"« {_env_display(env)} » existe déjà : non écrasé", severity="warning")
+            return False
+        write_env_text(path, serialize_env(variables))
+        self.app.envs.append(env)
+        return True
+
+    def action_import_postman(self, target: str | None = None) -> None:
+        """Import d'une collection ou d'un environnement Postman exporté (JSON)."""
+        def done(result: tuple[str, str] | None) -> None:
+            if not result:
+                return
+            source, target = result
+            parts = self._valid_parts(target) if target.strip().strip("/") else []
+            if parts is None:
+                return
+            base = "/".join(parts)
+            # chemin relatif : par rapport à HTTP_ROOT (/work/http dans Docker)
+            path = self.app.root / Path(source).expanduser()
+            try:
+                imported = parse_postman(json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, ValueError) as exc:
+                self.notify(f"Import Postman impossible : {exc}", severity="error")
+                return
+            try:
+                self._save_postman(imported, base)
+            except OSError as exc:
+                self.notify(f"Enregistrement impossible : {exc}", severity="error")
+                # import partiel : l'arbre montre ce qui a déjà été écrit
+                self._show(None, self._expanded_folders())
+            for warning in imported.warnings:
+                self.notify(warning, severity="warning")
+
+        if target is None:
+            folder = self._selected_folder()
+            target = f"{folder}/" if folder else ""
+        self.app.push_screen(PostmanPrompt(target), done)
+
+    def action_export_postman(self, everything: bool = False) -> None:
+        """Exporte en collection v2.1 la requête ou le dossier (récursif) sous le
+        curseur, ou toutes les requêtes si `everything`."""
+        node = self._cursor_node()
+        item = node.data if node is not None else None
+        if everything:
+            name, requests, folders, base = (
+                self.app.requests_dir.resolve().name or "requêtes",
+                self.app.requests, self._folders, "",
+            )
+            item = ""
+        elif isinstance(item, HttpRequest):
+            name, requests, folders, base = item.name, [item], [], item.folder
+        elif isinstance(item, str) and item:  # nœud de dossier
+            name, requests, folders, base = (
+                item.rpartition("/")[2], self.app.requests, self._folders, item,
+            )
+        else:
+            self.notify("Sélectionne une requête ou un dossier à exporter", severity="warning")
+            return
+        collection = to_postman(name, requests, folders, base)
+
+        def write(path: Path) -> None:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    json.dumps(collection, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+            except OSError as exc:
+                self.notify(f"Export impossible : {exc}", severity="error")
+                return
+            self.notify(f"Collection « {name} » exportée dans {path}")
+
+        def chosen(result: tuple[str, str] | None) -> None:
+            if not result:
+                return
+            path = self.app.root / Path(result[1].strip()).expanduser()
+            if not path.exists():
+                write(path)
+                return
+            self.app.push_screen(
+                ConfirmPrompt(f"« {path} » existe déjà. L'écraser ?", "Écraser"),
+                lambda ok: write(path) if ok else None,
+            )
+
+        if everything:
+            what = "toutes les requêtes"
+        elif isinstance(item, HttpRequest):
+            what = f"la requête « {_leaf_path(item)} »"
+        else:
+            what = f"le dossier « {item} » (récursif)"
+        self.app.push_screen(
+            PathPrompt(
+                f"Exporter {what} vers (fichier JSON, relatif à {self.app.root})",
+                ok_label="Exporter",
+                value=f"{name}.postman_collection.json",
+            ),
+            chosen,
+        )
+
+    def _save_postman(self, imported, base: str) -> None:
+        """Écrit les requêtes / variables importées sous le dossier `base`."""
+        if imported.is_environment:
+            env = EnvFile(imported.name, base)
+            if self._write_env(env, imported.variables):
+                self.notify(f"Environnement importé : {_env_display(env)}")
+            self._show(env, self._expanded_folders())
+            return
+        saved: list[HttpRequest] = []
+        for req in imported.requests:
+            req.folder = "/".join(p for p in (base, req.folder) if p)
+            # jamais d'écrasement : nom rendu unique dans son dossier
+            req.name = self._unique_name(req.name, req.folder)
+            save_request(self.app.requests_dir, req)
+            # ajoutée tout de suite : `_unique_name` doit la voir pour la suivante
+            self.app.requests.append(req)
+            saved.append(req)
+        # variables de collection : un .env par dossier importé (portée = dossier seul)
+        if imported.variables:
+            for folder in sorted({r.folder for r in saved}):
+                self._write_env(EnvFile(imported.name, folder), imported.variables)
+        folders = {r.folder for r in saved}
+        # dépliés : les dossiers importés et tous leurs parents
+        expanded = {"/".join(f.split("/")[:i]) for f in folders for i in range(1, f.count("/") + 2)}
+        self._show(saved[0] if saved else None, self._expanded_folders() | expanded)
+        self.notify(f"{len(saved)} requête(s) importée(s) depuis « {imported.name} »")
+
+    def action_delete(self) -> None:
+        """Supprime (après confirmation) la requête ou l'environnement sous le curseur."""
+        node = self._cursor_node()
+        item = node.data if node is not None else None
+        if not _leaf_key(item):
+            self.notify("Sélectionne une requête ou un environnement à supprimer", severity="warning")
+            return
+        is_env = isinstance(item, EnvFile)
+        noun = "l'environnement" if is_env else "la requête"
 
         def done(confirmed: bool | None) -> None:
             if not confirmed:
                 return
             try:
-                delete_request(self.app.requests_dir, req)
+                if is_env:
+                    env_path(self.app.requests_dir, item).unlink(missing_ok=True)
+                else:
+                    delete_request(self.app.requests_dir, item)
             except OSError as exc:
                 self.notify(f"Suppression impossible : {exc}", severity="error")
                 return
-            # curseur ensuite sur la requête suivante affichée (sinon la précédente)
-            shown = [n.data for n in self._iter_nodes() if isinstance(n.data, HttpRequest)]
-            i = next(k for k, r in enumerate(shown) if r is req)
+            # curseur ensuite sur la feuille suivante affichée (sinon la précédente)
+            shown = [n.data for n in self._iter_nodes() if _leaf_key(n.data)]
+            i = next(k for k, r in enumerate(shown) if r is item)
             if i + 1 < len(shown):
                 neighbour = shown[i + 1]
             elif i > 0:
                 neighbour = shown[i - 1]
             else:
                 neighbour = None
-            self.app.requests = [r for r in self.app.requests if r is not req]
+            self.app.requests = [r for r in self.app.requests if r is not item]
+            self.app.envs = [e for e in self.app.envs if e is not item]
             node.remove()
-            self._focus_request(neighbour)
-            self.notify(f"Requête « {_request_path(req)} » supprimée")
+            self._focus_leaf(neighbour)
+            done_msg = "Environnement « {} » supprimé" if is_env else "Requête « {} » supprimée"
+            self.notify(done_msg.format(_leaf_path(item)))
 
         self.app.push_screen(
-            ConfirmPrompt(f"Supprimer la requête « {_request_path(req)} » ?", "Supprimer"),
+            ConfirmPrompt(f"Supprimer {noun} « {_leaf_path(item)} » ?", "Supprimer"),
             done,
         )
 
@@ -604,8 +1019,7 @@ class RequestListScreen(Screen):
         """Relit les `.http` (modifiés par un éditeur externe) sans perdre la vue."""
         node = self._cursor_node()
         current = node.data if node is not None else None
-        select = (current.folder, current.name) if isinstance(current, HttpRequest) else None
-        self._load_requests(select=select, expanded=self._expanded_folders())
+        self._load_requests(select=_leaf_key(current), expanded=self._expanded_folders())
         self.notify(f"{len(self.app.requests)} requête(s) rechargée(s) depuis le disque")
 
 
@@ -633,6 +1047,8 @@ class RequestScreen(Screen[HttpRequest]):
         self._fuzz_filter = ""
         self._fuzz_sort: tuple[str, bool] | None = None
         self._filter_timer: Timer | None = None
+        # listes proposées par le sélecteur de balise (pour détecter un changement)
+        self._fuzz_names = self.app.fuzzer.available()
 
     def compose(self) -> ComposeResult:
         with Vertical(id="editor"):
@@ -649,7 +1065,7 @@ class RequestScreen(Screen[HttpRequest]):
                 yield Button("Enregistrer", id="save", variant="success")
                 # choisir une liste copie sa balise {{fuzz:…}}, à coller où l'on veut
                 yield Select(
-                    [(n, n) for n in self.app.fuzzer.available()],
+                    [(n, n) for n in self._fuzz_names],
                     id="fuzzlist", prompt="Balise {{fuzz:…}}", allow_blank=True,
                 )
             # onglets principaux ; « Requête » contient Headers / Body
@@ -678,6 +1094,22 @@ class RequestScreen(Screen[HttpRequest]):
         self.query_one("#body", TextArea).text = req.body
         self._build_fuzz_columns()
         self.query_one("#url", Input).focus()
+
+    def _warn_headers(self) -> None:
+        """Signale les lignes d'en-tête ignorées (sans `:`) ou en double."""
+        lines = self.query_one("#headers", TextArea).text.splitlines()
+        invalid = invalid_header_lines(lines)
+        if invalid:
+            self.notify(
+                f"En-tête(s) sans « : » ignoré(s) : {', '.join(invalid)}", severity="warning"
+            )
+        names = [line.partition(":")[0].strip().lower() for line in lines if ":" in line]
+        duplicates = sorted({n for n in names if names.count(n) > 1})
+        if duplicates:
+            self.notify(
+                f"En-tête(s) en double, seule la dernière valeur est gardée : {', '.join(duplicates)}",
+                severity="warning",
+            )
 
     def _current_request(self) -> HttpRequest:
         """Requête ouverte (nom, dossier) avec les champs de l'éditeur."""
@@ -771,6 +1203,7 @@ class RequestScreen(Screen[HttpRequest]):
         # le nom et le dossier (= chemin du fichier) restent ceux de la requête ouverte
         old = self._request
         edited = self._current_request()
+        self._warn_headers()
         try:
             path = save_request(self.app.requests_dir, edited)
         except OSError as exc:
@@ -783,35 +1216,72 @@ class RequestScreen(Screen[HttpRequest]):
         self.notify(f"Enregistrée dans {path}")
 
     def _reload_fuzz_lists(self) -> None:
-        """Relit le répertoire de listes (fichiers ajoutés/modifiés à chaud)."""
-        app = self.app
-        old_names = app.fuzzer.available()
-        app.fuzzer = Fuzzer.from_directory(app.fuzz_dir)
-        names = app.fuzzer.available()
+        """Met à jour le choix de balise (fichiers de listes ajoutés/retirés à chaud)."""
+        names = self.app.fuzzer.available()
         # set_options réinitialise la sélection : seulement si les listes changent
-        if names != old_names:
+        if names != self._fuzz_names:
+            self._fuzz_names = names
             self.query_one("#fuzzlist", Select).set_options([(n, n) for n in names])
 
     def _check_fuzz_lists(self, request: HttpRequest) -> bool:
-        """Faux (avec alerte) si une balise vise une liste absente du répertoire."""
+        """Faux (avec alerte) si une balise vise une liste absente ou vide."""
         missing = self.app.fuzzer.missing_lists(request)
         if missing:
             self.notify(
-                f"Liste(s) introuvable(s) dans {self.app.fuzz_dir} : {', '.join(missing)}",
+                f"Liste(s) introuvable(s) ou vide(s) dans {self.app.fuzz_dir} : {', '.join(missing)}",
                 severity="error",
             )
         return not missing
 
-    def _prepare_combos(self) -> list[tuple[dict[str, str], HttpRequest]] | None:
-        """Requête de l'éditeur développée en combinaisons (None si liste absente)."""
+    def _with_env(self, then: Callable[[HttpRequest], None]) -> None:
+        """Demande l'environnement (si le dossier en a) puis appelle `then`
+        avec la requête de l'éditeur, variables `{{NOM}}` substituées."""
         request = self._current_request()
+        self._warn_headers()
+        folder = request.folder
+        envs = list_folder_envs(self.app.requests_dir, folder)
+
+        def chosen(name: str | None) -> None:
+            if name is None:
+                return  # annulé
+            self.app.last_env[folder] = name
+            variables: dict[str, str] = {}
+            if name != _NO_ENV:
+                try:
+                    variables = read_env(self.app.requests_dir, EnvFile(name, folder))
+                except OSError as exc:
+                    self.notify(f"Environnement illisible : {exc}", severity="error")
+                    return
+            concrete = substitute(request, variables)
+            missing = used_variables(concrete)
+            if missing:
+                self.notify(
+                    f"Variable(s) non définie(s), envoyées telles quelles : {', '.join(missing)}",
+                    severity="warning",
+                )
+            then(concrete)
+
+        if not envs:
+            chosen(_NO_ENV)
+            return
+        self.app.push_screen(
+            EnvPrompt(folder, envs, self.app.last_env.get(folder)), chosen
+        )
+
+    def _prepare_combos(
+        self, request: HttpRequest
+    ) -> list[tuple[dict[str, str], HttpRequest]] | None:
+        """Requête développée en combinaisons de fuzzing (None si liste absente)."""
         self._reload_fuzz_lists()
         if not self._check_fuzz_lists(request):
             return None
         return self.app.fuzzer.expand(request)
 
     def action_send(self) -> None:
-        combos = self._prepare_combos()
+        self._with_env(self._send)
+
+    def _send(self, request: HttpRequest) -> None:
+        combos = self._prepare_combos(request)
         if combos is None:
             return
         if len(combos) > 1:
@@ -820,28 +1290,43 @@ class RequestScreen(Screen[HttpRequest]):
         self.query_one("#main-tabs", TabbedContent).active = "tab-response"
         self._do_send(concrete)
 
-    @work(exclusive=True)
+    # groupes distincts : un envoi simple n'annule pas un fuzzing en cours (et inversement)
+    @work(exclusive=True, group="send")
     async def _do_send(self, request: HttpRequest) -> None:
         self.query_one("#response", TextArea).text = "⏳ Envoi en cours…"
         result = await send_request(request, client=self.app.client)
         self.query_one("#response", TextArea).text = self._format_result(result)
 
     def action_fuzz(self) -> None:
-        combos = self._prepare_combos()
+        self._with_env(self._fuzz)
+
+    def _fuzz(self, request: HttpRequest) -> None:
+        combos = self._prepare_combos(request)
         if combos is None:
             return
         if len(combos) <= 1:
             self.notify("Aucune balise {{fuzz:…}} dans la requête", severity="warning")
             return
+        total = self.app.fuzzer.count(request)
+        if total > len(combos):
+            self.notify(
+                f"{total} combinaisons : seules les {len(combos)} premières sont envoyées",
+                severity="warning",
+            )
         self.query_one("#main-tabs", TabbedContent).active = "tab-fuzz"
         self.fuzz_rows = []
         self._build_fuzz_columns()
         self._run_fuzz(combos)
 
-    @work(exclusive=True)
+    def _fuzz_progress(self, text: str) -> None:
+        """Avancement affiché dans le titre de l'onglet Fuzzing."""
+        self.query_one("#main-tabs", TabbedContent).get_tab("tab-fuzz").label = text
+
+    @work(exclusive=True, group="fuzz")
     async def _run_fuzz(self, combos) -> None:
         total = len(combos)
         self.notify(f"Fuzzing : {total} requêtes…")
+        self._fuzz_progress(f"Fuzzing ⏳ 0/{total}")
         # envoi concurrent borné, sur le client partagé (keep-alive)
         sem = asyncio.Semaphore(_FUZZ_CONCURRENCY)
 
@@ -862,10 +1347,12 @@ class RequestScreen(Screen[HttpRequest]):
                 row = await task
                 self.fuzz_rows.append(row)
                 self._append_fuzz_row(row)  # respecte le filtre, ignore le tri
+                self._fuzz_progress(f"Fuzzing ⏳ {len(self.fuzz_rows)}/{total}")
         finally:
             # worker annulé (retour à la liste, nouveau fuzz) : on stoppe les envois restants
             for task in tasks:
                 task.cancel()
+        self._fuzz_progress(f"Fuzzing ✓ {total}")
 
         # les réponses arrivent dans le désordre : on remet l'ordre des requêtes
         # avant le rendu final (le tri explicite éventuel reste prioritaire)
@@ -922,10 +1409,12 @@ class RequestScreen(Screen[HttpRequest]):
         if result.error:
             return f"✗ Erreur : {result.error}"
         head = f"{result.status} {result.reason}   {result.elapsed_ms:.0f} ms   {result.size} octets"
+        # redirections suivies : le statut affiché est celui de la dernière réponse
+        redirects = "".join(f"↪ {r}\n" for r in result.redirects)
         body = result.body
         if len(body) > _MAX_BODY_SHOW:
             body = f"{body[:_MAX_BODY_SHOW]}\n\n… corps tronqué à l'affichage ({len(result.body)} caractères)"
-        return f"{head}\n{'─' * len(head)}\n{format_headers(result.headers)}\n\n{body}"
+        return f"{redirects}{head}\n{'─' * len(head)}\n{format_headers(result.headers)}\n\n{body}"
 
 
 class HttpTui(BaseApp):
@@ -940,8 +1429,13 @@ class HttpTui(BaseApp):
     ):
         super().__init__()
         # un fichier .http par requête, dans ce répertoire
+        self.root = Path(root)
         self.requests_dir = Path(requests_dir)
         self.requests: list[HttpRequest] = []
+        # fichiers .env.* (environnements) du répertoire des requêtes
+        self.envs: list[EnvFile] = []
+        # dernier environnement choisi à l'envoi, par dossier (pré-sélectionné)
+        self.last_env: dict[str, str] = {}
         # listes de fuzzing : un fichier .txt par liste
         self.fuzz_dir = Path(fuzz_dir) if fuzz_dir else Path(root) / "fuzz"
         self.fuzzer = Fuzzer.from_directory(self.fuzz_dir)
@@ -956,6 +1450,12 @@ class HttpTui(BaseApp):
 
     def get_system_commands(self, screen):
         yield from super().get_system_commands(screen)
+        if isinstance(screen, RequestListScreen):
+            yield SystemCommand(
+                "Export Postman (tout)",
+                "Exporter toutes les requêtes en une collection Postman",
+                lambda: screen.action_export_postman(everything=True),
+            )
         if isinstance(screen, RequestScreen):
             yield SystemCommand(
                 "Requêtes", "Revenir à la liste des requêtes", screen.action_back

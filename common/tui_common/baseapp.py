@@ -11,7 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable
 
-from textual.app import App, SystemCommand
+from textual.app import App, ScreenStackError, SystemCommand
 from textual.binding import Binding
 from textual.screen import Screen
 from textual.widgets import TextArea
@@ -52,17 +52,13 @@ class BaseApp(App):
             selected = focused.selected_text
             if selected:
                 return selected
-        # 2) sélection applicative (texte des widgets statiques), si la
-        #    version de Textual l'expose
-        getter = getattr(self, "get_selected_text", None)
-        if callable(getter):
-            try:
-                text = getter()
-                if text:
-                    return text
-            except Exception:
-                pass
-        return ""
+        # 2) sélection à la souris dans les widgets statiques (Static, Label,
+        #    RichLog, DataTable…) : portée par l'écran, pas par l'App
+        try:
+            screen = self.screen
+        except ScreenStackError:  # aucun écran (démarrage / fermeture)
+            return ""
+        return screen.get_selected_text() or ""
 
     def _auto_copy(self) -> None:
         text = self._selected_text()

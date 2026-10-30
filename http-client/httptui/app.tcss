@@ -74,3 +74,8 @@ RequestListScreen {
 #curl-command {
     height: 14;
 }
+
+#env-choice {
+    height: auto;
+    max-height: 16;
+}

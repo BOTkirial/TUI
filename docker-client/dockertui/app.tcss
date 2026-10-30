@@ -56,6 +56,12 @@ FilterPane {
     margin-top: 1;
 }
 
+/* min-width par défaut (16) : à 80 colonnes, les 6 boutons de l'onglet
+   Conteneurs débordaient et « Down » (destructif) sortait de l'écran */
+.pane-buttons Button {
+    min-width: 8;
+}
+
 .pane-count {
     height: auto;
     color: $text-muted;
@@ -68,4 +74,9 @@ FilterPane {
 
 #log-output, #inspect-output {
     height: 1fr;
+}
+
+/* ligne d'état bornée : un message d'erreur long ne doit pas écraser les onglets */
+#status {
+    max-height: 3;
 }

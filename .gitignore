@@ -10,3 +10,6 @@ venv/
 # Variables d'environnement locales
 .env
 .env.*
+
+# exports Postman : contiennent les en-têtes Authorization / Cookie
+*.postman_collection.json

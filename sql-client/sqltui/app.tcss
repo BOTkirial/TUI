@@ -8,18 +8,33 @@ ConnectionScreen {
 #conn-page {
     width: 90;
     max-width: 100%;
-    height: auto;
+    /* toute la hauteur : la liste prend la place restante (et rétrécit sur un
+       petit terminal au lieu de pousser boutons et statut hors de l'écran) */
+    height: 1fr;
     margin: 1 0;
     padding: 1 2;
     border: round $accent;
+}
+
+/* terminal bas (VERTICAL_BREAKPOINTS de ConnectionScreen) : marges et aide
+   retirées pour garder boutons et statut (progression, erreurs) à l'écran */
+ConnectionScreen.-short #conn-page {
+    margin: 0;
+    padding: 0 2;
+}
+
+ConnectionScreen.-short #conn-page .hint {
+    display: none;
 }
 
 #filter {
     margin-bottom: 1;
 }
 
+/* hauteur souple : au moins 2 connexions visibles */
 #connections {
-    height: 12;
+    height: 1fr;
+    min-height: 4;
 }
 
 /* --- écran de requêtes --- */
@@ -49,6 +64,28 @@ ConnectionScreen {
 
 #results {
     height: 1fr;
+}
+
+/* statut + bouton plein écran sur une seule ligne */
+#status-bar {
+    height: auto;
+    margin-top: 1;
+}
+
+#status-bar #status {
+    width: 1fr;
+    margin-top: 0;
+}
+
+/* plein écran (ctrl+f) : seuls les résultats, le statut et le pied de page */
+QueryScreen.-results-full #sidebar,
+QueryScreen.-results-full #query-title,
+QueryScreen.-results-full #query {
+    display: none;
+}
+
+QueryScreen.-results-full #workspace {
+    padding: 0;
 }
 
 /* --- formulaire de connexion (fenêtre modale) --- */

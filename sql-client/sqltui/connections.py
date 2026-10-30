@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import tempfile
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
@@ -69,12 +70,33 @@ class ConnectionStore:
         """Copie le fichier (illisible) avant qu'une sauvegarde ne l'écrase."""
         target = self.path.with_name(self.path.name + ".bak")
         shutil.copyfile(self.path, target)
+        os.chmod(target, 0o600)  # mots de passe en clair, comme l'original
         return target
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        data = [asdict(c) for c in self.connections]
-        self.path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        """Écriture atomique (fichier temporaire puis renommage), lisible du seul propriétaire.
+
+        Le fichier contient les mots de passe en clair ; une écriture interrompue
+        (disque plein, arrêt) ne doit pas laisser un fichier tronqué.
+        """
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        data = json.dumps([asdict(c) for c in self.connections], indent=2, ensure_ascii=False)
+        # même dossier : os.replace reste un renommage atomique ; mkstemp crée en 0600
+        fd, tmp = tempfile.mkstemp(
+            dir=self.path.parent, prefix=f".{self.path.name}.", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     def _put(self, old_name: str, connection: Connection) -> None:
         # remplace `old_name` en conservant sa position, sinon ajoute en fin
@@ -85,7 +107,10 @@ class ConnectionStore:
         self.connections.append(connection)
 
     def add(self, *connections: Connection) -> None:
-        """Ajoute (ou remplace par nom) une ou plusieurs connexions, une seule écriture."""
+        """Ajoute (ou remplace par nom) une ou plusieurs connexions, une seule écriture.
+
+        L'appelant vérifie les doublons s'il ne veut pas remplacer (formulaire, import).
+        """
         for connection in connections:
             self._put(connection.name, connection)
         self.save()

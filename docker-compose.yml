@@ -9,12 +9,18 @@ services:
     # réseau de l'hôte : localhost/127.0.0.1 désignent la machine, pas le conteneur
     # (bases locales et connexions DBeaver en localhost accessibles telles quelles)
     network_mode: host
+    # init (tini) en PID 1 : récupère les processus docker/compose orphelins (zombies)
+    init: true
     working_dir: /work
     environment:
       HTTP_ROOT: /work/http
       HTTP_REQUESTS_DIR: /work/http/requests
       # connexions SQL (+ known_hosts SSH) dans le workspace, ignorées par git
       SQL_CONNECTIONS_DIR: /work/sql/connections
+      # docker-tui : `compose up` résout ${HOME}/${USER} des fichiers compose
+      # comme sur l'hôte (dans le conteneur, HOME=/root)
+      HOST_HOME: ${HOME}
+      HOST_USER: ${USER:-}
     volumes:
       - ./workspace:/work
       # Pour importer tes vraies connexions DBeaver (lecture seule) :

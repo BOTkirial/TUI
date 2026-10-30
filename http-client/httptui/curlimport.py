@@ -11,7 +11,7 @@ import base64
 from pathlib import PurePosixPath
 from urllib.parse import urlparse
 
-from .httpfile import HttpRequest
+from .httpfile import METHODS, HttpRequest
 
 # en-têtes qu'on ne réécrit pas (recalculés ou dérivés de l'URL)
 _SKIP_HEADERS = {"content-length", "host"}
@@ -154,7 +154,7 @@ def _set_header(headers: dict[str, str], raw: str) -> None:
         headers[name] = value
 
 
-def _has_header(headers: dict[str, str], name: str) -> bool:
+def has_header(headers: dict[str, str], name: str) -> bool:
     return any(k.lower() == name.lower() for k in headers)
 
 
@@ -209,9 +209,9 @@ def parse_curl(command: str) -> tuple[HttpRequest, list[str]]:
             data.append(arg())
         elif name == "--json":
             data.append(arg())
-            if not _has_header(headers, "Content-Type"):
+            if not has_header(headers, "Content-Type"):
                 headers["Content-Type"] = "application/json"
-            if not _has_header(headers, "Accept"):
+            if not has_header(headers, "Accept"):
                 headers["Accept"] = "application/json"
         elif name in ("-u", "--user"):
             token = base64.b64encode(arg().encode()).decode()
@@ -238,7 +238,7 @@ def parse_curl(command: str) -> tuple[HttpRequest, list[str]]:
     if force_get and body:
         url += ("&" if "?" in url else "?") + body
         body = ""
-    if body and not _has_header(headers, "Content-Type"):
+    if body and not has_header(headers, "Content-Type"):
         # comportement de curl pour -d sans Content-Type explicite
         headers["Content-Type"] = "application/x-www-form-urlencoded"
     if any(d.startswith("@") for d in data):
@@ -246,6 +246,9 @@ def parse_curl(command: str) -> tuple[HttpRequest, list[str]]:
 
     if method is None:
         method = "GET" if force_get or not body else "POST"
+    elif method not in METHODS:
+        warnings.append(f"méthode {method} non gérée, remplacée par GET")
+        method = "GET"
     return HttpRequest(method=method, url=url, headers=headers, body=body), warnings
 
 
@@ -253,4 +256,6 @@ def request_name(req: HttpRequest) -> str:
     """Nom par défaut : dernier segment du chemin, ou l'hôte (la méthode est
     déjà affichée dans l'arbre)."""
     parsed = urlparse(req.url)
-    return PurePosixPath(parsed.path).name or parsed.netloc or "requête"
+    # pas de `.` en tête : `/.env` donnerait un fichier caché (ou pris pour un .env.*)
+    name = PurePosixPath(parsed.path).name.lstrip(".") or parsed.netloc
+    return name or "requête"

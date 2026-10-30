@@ -7,8 +7,9 @@ du répertoire de listes. Toute autre accolade est laissée telle quelle.
 from __future__ import annotations
 
 import itertools
+import math
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .httpfile import HttpRequest
@@ -43,31 +44,49 @@ def read_list_file(path: str | Path) -> list[str]:
 
 @dataclass
 class Fuzzer:
-    """Détient les listes disponibles et génère les requêtes concrètes."""
+    """Listes d'un répertoire (un `*.txt` par liste) et génération des requêtes.
 
-    lists: dict[str, list[str]]
+    Une liste n'est lue que si une requête la référence, puis gardée en cache
+    tant que son fichier n'est pas modifié : une grosse liste (rockyou…) posée
+    dans le répertoire ne ralentit pas chaque envoi.
+    """
+
+    directory: Path
+    # nom -> (mtime du fichier, valeurs)
+    _cache: dict[str, tuple[float, list[str]]] = field(default_factory=dict)
 
     @classmethod
     def from_directory(cls, directory: str | Path) -> "Fuzzer":
-        """Charge chaque `*.txt` du répertoire ; le nom du fichier = nom de liste."""
-        lists: dict[str, list[str]] = {}
-        folder = Path(directory)
-        if folder.is_dir():
-            for path in sorted(folder.glob("*.txt")):
-                # seuls les noms utilisables dans une balise {{fuzz:…}}
-                if LIST_NAME_RE.fullmatch(path.stem):
-                    try:
-                        lists[path.stem] = read_list_file(path)
-                    except OSError:
-                        continue  # illisible : signalée comme absente à l'envoi
-        return cls(lists=lists)
-
-    def missing_lists(self, request: HttpRequest) -> list[str]:
-        """Listes référencées par la requête mais introuvables."""
-        return [name for name in self._fuzz_points(request) if name not in self.lists]
+        return cls(Path(directory))
 
     def available(self) -> list[str]:
-        return sorted(self.lists)
+        """Listes du répertoire (noms utilisables dans une balise {{fuzz:…}})."""
+        if not self.directory.is_dir():
+            return []
+        return sorted(
+            p.stem for p in self.directory.glob("*.txt") if LIST_NAME_RE.fullmatch(p.stem)
+        )
+
+    def _values(self, name: str) -> list[str] | None:
+        """Valeurs de la liste `name` (relue si modifiée), None si illisible."""
+        path = self.directory / f"{name}.txt"
+        try:
+            mtime = path.stat().st_mtime
+            cached = self._cache.get(name)
+            if cached is None or cached[0] != mtime:
+                self._cache[name] = (mtime, read_list_file(path))
+        except OSError:
+            self._cache.pop(name, None)
+            return None
+        return self._cache[name][1]
+
+    def missing_lists(self, request: HttpRequest) -> list[str]:
+        """Listes référencées par la requête mais introuvables ou vides."""
+        return [name for name in self._fuzz_points(request) if not self._values(name)]
+
+    def count(self, request: HttpRequest) -> int:
+        """Nombre total de combinaisons, avant la borne `MAX_COMBINATIONS`."""
+        return math.prod(len(self._values(n) or [""]) for n in self._fuzz_points(request))
 
     def _fuzz_points(self, request: HttpRequest) -> list[str]:
         """Liste ordonnée et dédoublonnée des listes de fuzz utilisées."""
@@ -90,7 +109,7 @@ class Fuzzer:
             return [({}, request)]
 
         # produit cartésien borné des valeurs de chaque liste
-        value_lists = [self.lists.get(name, [""]) for name in points]
+        value_lists = [self._values(name) or [""] for name in points]
         combos = itertools.islice(
             itertools.product(*value_lists), MAX_COMBINATIONS
         )

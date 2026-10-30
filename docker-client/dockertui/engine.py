@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import signal
 import subprocess
+import threading
 from dataclasses import dataclass, field
 
 # labels posés par docker compose sur ses conteneurs
@@ -23,26 +26,96 @@ BUILTIN_NETWORKS = {"bridge", "host", "none"}
 
 _TIMEOUT = 120
 
+# processus docker en cours, tués à la sortie de l'app : sinon la fermeture attend
+# la fin des workers thread (un `compose up` peut durer plusieurs minutes)
+_processes: set[subprocess.Popen] = set()
+_processes_lock = threading.Lock()
+_shutting_down = False
+
 
 class DockerError(Exception):
     """Commande docker en échec (message = stderr du CLI)."""
 
+    def tail(self, lines: int = 1) -> str:
+        """Dernières lignes non vides du message : l'erreur réelle, après les
+        lignes de progression que `compose up` écrit aussi sur stderr."""
+        kept = [line.strip() for line in str(self).splitlines() if line.strip()]
+        return "\n".join(kept[-lines:])
 
-def run(*args: str, timeout: int = _TIMEOUT) -> str:
-    """Exécute `docker <args>` et renvoie stdout ; lève DockerError en cas d'échec."""
+
+def _popen(args: list[str], **kwargs) -> subprocess.Popen:
+    """Lance `docker <args>` dans son propre groupe de processus, suivi par `_processes`.
+
+    Groupe dédié : le plugin compose est un processus fils du CLI, tuer le CLI
+    seul le laisserait orphelin ; `_kill` vise tout le groupe.
+    """
+    with _processes_lock:
+        if _shutting_down:
+            raise DockerError("fermeture en cours")
+        try:
+            proc = subprocess.Popen(
+                ["docker", *args], stdin=subprocess.DEVNULL, start_new_session=True, **kwargs
+            )
+        except FileNotFoundError as exc:
+            raise DockerError("CLI `docker` introuvable dans le PATH") from exc
+        _processes.add(proc)
+    return proc
+
+
+def _forget(proc: subprocess.Popen) -> None:
+    with _processes_lock:
+        _processes.discard(proc)
+
+
+def _kill(proc: subprocess.Popen, sig: int = signal.SIGKILL) -> None:
+    """Signal à tout le groupe du processus (CLI + plugin compose)."""
+    if proc.returncode is not None:
+        return  # déjà attendu : son PID a pu être réattribué
     try:
-        proc = subprocess.run(
-            ["docker", *args], capture_output=True, timeout=timeout,
-            # décodage explicite : ne dépend pas de la locale du conteneur
-            text=True, encoding="utf-8", errors="replace",
-        )
-    except FileNotFoundError as exc:
-        raise DockerError("CLI `docker` introuvable dans le PATH") from exc
+        os.killpg(proc.pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass  # déjà terminé
+
+
+def kill_all() -> None:
+    """Tue les commandes docker en cours et refuse les suivantes (sortie de l'app).
+
+    Les opérations déjà transmises au démon (téléchargement, arrêt…) continuent
+    côté Docker ; seul le client est interrompu.
+    """
+    global _shutting_down
+    with _processes_lock:
+        _shutting_down = True
+        running = list(_processes)
+    for proc in running:
+        _kill(proc)
+
+
+def _exec(args: tuple[str, ...], timeout: int, env: dict[str, str] | None = None
+          ) -> tuple[int, str, str]:
+    """Exécute `docker <args>` : (code de retour, stdout, stderr)."""
+    proc = _popen(
+        list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+        # décodage explicite : ne dépend pas de la locale du conteneur
+        text=True, encoding="utf-8", errors="replace",
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
+        _kill(proc)
+        proc.communicate()
         raise DockerError(f"délai dépassé : docker {' '.join(args)}") from exc
-    if proc.returncode != 0:
-        raise DockerError(proc.stderr.strip() or f"docker {args[0]} : code {proc.returncode}")
-    return proc.stdout
+    finally:
+        _forget(proc)
+    return proc.returncode, stdout, stderr
+
+
+def run(*args: str, timeout: int = _TIMEOUT, env: dict[str, str] | None = None) -> str:
+    """Exécute `docker <args>` et renvoie stdout ; lève DockerError en cas d'échec."""
+    code, stdout, stderr = _exec(args, timeout, env)
+    if code != 0:
+        raise DockerError(stderr.strip() or f"docker {args[0]} : code {code}")
+    return stdout
 
 
 def _json_lines(output: str) -> list[dict]:
@@ -66,7 +139,7 @@ class Container:
     image: str
     image_id: str
     state: str  # running, exited, paused, created…
-    status: str  # « Up 3 hours », « Exited (0) 2 days ago »…
+    status: str  # état détaillé : « running (healthy) », « exited (0) »…
     ports: str
     labels: dict[str, str]
     mounts: list[Mount] = field(default_factory=list)
@@ -170,8 +243,17 @@ def _inspect_containers() -> list[Container]:
     ids = run("ps", "-a", "-q", "--no-trunc").split()
     if not ids:
         return []
+    # conteneur supprimé entre `ps` et `inspect` : code 1 (« No such container »),
+    # mais les autres sont bien décrits sur stdout
+    code, stdout, stderr = _exec(("container", "inspect", *ids), _TIMEOUT)
+    try:
+        inspected = json.loads(stdout)
+    except ValueError:
+        inspected = None
+    if not isinstance(inspected, list):
+        raise DockerError(stderr.strip() or f"docker container inspect : code {code}")
     containers = []
-    for data in json.loads(run("container", "inspect", *ids)):
+    for data in inspected:
         state = data.get("State") or {}
         config = data.get("Config") or {}
         net = data.get("NetworkSettings") or {}
@@ -279,6 +361,24 @@ def _volumes(containers: list[Container]) -> list[Volume]:
     return volumes
 
 
+_CONTAINER_ID = re.compile(r"/containers/([0-9a-f]{64})/")
+
+
+def own_container_id() -> str:
+    """ID (12 caractères) du conteneur qui exécute la TUI, "" hors Docker.
+
+    Lu dans les montages de /etc/hostname, /etc/hosts… que Docker fait depuis
+    `/var/lib/docker/containers/<id>/` (le nom d'hôte ne sert à rien : le
+    conteneur `tui` est en `network_mode: host`, il a celui de la machine).
+    """
+    try:
+        with open("/proc/self/mountinfo", encoding="utf-8") as f:
+            m = _CONTAINER_ID.search(f.read())
+    except OSError:
+        return ""
+    return m[1][:12] if m else ""
+
+
 def snapshot() -> Snapshot:
     containers = _inspect_containers()
     return Snapshot(
@@ -290,6 +390,25 @@ def snapshot() -> Snapshot:
 
 
 # --- actions -------------------------------------------------------------
+def _host_env() -> dict[str, str] | None:
+    """Environnement de `compose up` : HOME/USER de l'hôte (HOST_HOME/HOST_USER,
+    fixées par docker-compose.yml), pour que `${HOME}`, `${USER}` des fichiers
+    compose désignent les mêmes chemins que sur l'hôte (sinon /root : montages
+    recréés au mauvais endroit). None = environnement courant (hors Docker)."""
+    home, user = os.environ.get("HOST_HOME"), os.environ.get("HOST_USER")
+    if not home and not user:
+        return None
+    env = dict(os.environ)
+    # la configuration du CLI (~/.docker) reste celle du conteneur : celle de
+    # l'hôte peut désigner des credential helpers absents de l'image
+    env.setdefault("DOCKER_CONFIG", os.path.expanduser("~/.docker"))
+    if home:
+        env["HOME"] = home
+    if user:
+        env["USER"] = user
+    return env
+
+
 def compose(stack: Stack, *args: str) -> str:
     """`docker compose` sur une stack existante.
 
@@ -298,6 +417,7 @@ def compose(stack: Stack, *args: str) -> str:
     `stop`/`down` se contentent du nom de projet (conteneurs retrouvés par label).
     """
     cmd = ["compose", "-p", stack.name]
+    env = None
     if args[0] == "up":
         missing = [f for f in stack.config_files if not os.path.isfile(f)]
         if not stack.config_files or missing:
@@ -310,27 +430,28 @@ def compose(stack: Stack, *args: str) -> str:
             cmd += ["--project-directory", stack.working_dir]
         for f in stack.config_files:
             cmd += ["-f", f]
+        env = _host_env()
     # up/down : construction d'images ou téléchargements possibles, délai large
-    return run(*cmd, *args, timeout=600)
+    return run(*cmd, *args, timeout=600, env=env)
 
 
 def follow_logs(target: Container | Stack, tail: int = 500) -> subprocess.Popen:
     """Flux `docker logs -f` d'un conteneur (`docker compose logs -f` pour une stack).
 
     stderr est fusionné dans stdout : beaucoup de conteneurs y écrivent leurs logs.
-    Sortie en octets (décodage laissé à l'appelant) ; l'appelant termine le processus.
+    Sortie en octets (décodage laissé à l'appelant) ; l'appelant l'arrête par `stop_logs`.
     """
     if isinstance(target, Stack):
         cmd = ["compose", "-p", target.name, "logs", "-f", "--tail", str(tail)]
     else:
         cmd = ["logs", "-f", "--tail", str(tail), target.id]
-    try:
-        return subprocess.Popen(
-            ["docker", *cmd], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-        )
-    except FileNotFoundError as exc:
-        raise DockerError("CLI `docker` introuvable dans le PATH") from exc
+    return _popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+
+def stop_logs(proc: subprocess.Popen) -> None:
+    """Arrête un flux de `follow_logs` (tout son groupe : CLI et plugin compose)."""
+    _kill(proc, signal.SIGTERM)
+    _forget(proc)
 
 
 def inspect(target: Container | Stack) -> str:

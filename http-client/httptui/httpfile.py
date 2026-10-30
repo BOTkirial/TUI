@@ -12,11 +12,15 @@ Les fichiers peuvent être rangés dans des sous-dossiers du répertoire des req
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 # ordre d'affichage dans le sélecteur de méthode
 METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE")
+
+# version HTTP optionnelle en fin de ligne de requête (`GET /x HTTP/1.1`)
+_HTTP_VERSION_RE = re.compile(r"\s+HTTP/\d(?:\.\d)?\s*$")
 
 
 @dataclass
@@ -35,6 +39,11 @@ class HttpRequest:
 
 def format_headers(headers: dict[str, str]) -> str:
     return "\n".join(f"{k}: {v}" for k, v in headers.items())
+
+
+def invalid_header_lines(lines: list[str]) -> list[str]:
+    """Lignes non vides sans `:`, ignorées par `parse_headers`."""
+    return [line.strip() for line in lines if line.strip() and ":" not in line]
 
 
 def parse_headers(lines: list[str]) -> dict[str, str]:
@@ -57,15 +66,13 @@ def _parse_block(name: str, lines: list[str]) -> HttpRequest | None:
     else:
         return None  # bloc sans ligne de requête
 
-    # ligne "METHOD URL [HTTP/x]"
-    parts = lines[idx].split()
-    if not parts:
-        return None
-    if parts[0].upper() in METHODS:
-        method = parts[0].upper()
-        url = parts[1] if len(parts) > 1 else ""
+    # ligne "METHOD URL [HTTP/x]" ; l'URL peut contenir des espaces (`?q=a b`)
+    line = _HTTP_VERSION_RE.sub("", lines[idx].strip())
+    first, _, rest = line.partition(" ")
+    if first.upper() in METHODS:
+        method, url = first.upper(), rest.strip()
     else:
-        method, url = "GET", parts[0]
+        method, url = "GET", line
     idx += 1
 
     # en-têtes jusqu'à une ligne vide
@@ -74,8 +81,8 @@ def _parse_block(name: str, lines: list[str]) -> HttpRequest | None:
         header_lines.append(lines[idx])
         idx += 1
 
-    # corps = le reste
-    body = "\n".join(lines[idx + 1:]).strip() if idx < len(lines) else ""
+    # corps = le reste (l'indentation de la 1re ligne est conservée)
+    body = "\n".join(lines[idx + 1:]).strip("\n").rstrip() if idx < len(lines) else ""
 
     return HttpRequest(
         name=name,
@@ -92,8 +99,11 @@ def parse_request_file(path: str | Path) -> HttpRequest | None:
     if not p.is_file():
         return None
     # errors="replace" : un fichier non UTF-8 s'affiche (accents abîmés) au lieu de
-    # faire échouer le chargement de toutes les requêtes
-    lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    # faire échouer le chargement de toutes les requêtes ; illisible = ignoré
+    try:
+        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
     # on tolère une éventuelle ligne de titre `###` héritée de l'ancien format
     if lines and lines[0].startswith("###"):
         lines = lines[1:]
@@ -138,9 +148,13 @@ def list_request_folders(directory: str | Path) -> list[str]:
 
 def serialize_request(req: HttpRequest) -> str:
     """Sérialise une requête seule (sans séparateur `###`)."""
-    lines = [f"{req.method} {req.url}"]
+    def one_line(text: str) -> str:
+        # un retour à la ligne (en-tête curl `$'…\n…'`) casserait le fichier
+        return " ".join(text.splitlines())
+
+    lines = [f"{req.method} {one_line(req.url)}"]
     for key, value in req.headers.items():
-        lines.append(f"{key}: {value}")
+        lines.append(f"{one_line(key)}: {one_line(value)}")
     if req.body.strip():
         lines.append("")
         lines.append(req.body.rstrip())
